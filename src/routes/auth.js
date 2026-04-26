@@ -64,22 +64,26 @@ router.post('/register', async (req, res) => {
   }
 });
 
-router.post('/login', async (req, res) => {
-  const email =
-    typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-  const password = typeof req.body.password === 'string' ? req.body.password : '';
-  if (!email || !password) {
-    return res.status(400).json({
-      success: false,
-      error: 'Email and password are required.',
-    });
+router.post('/login', async (req, res, next) => {
+  try {
+    const email =
+      typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password are required.',
+      });
+    }
+    const user = await User.findOne({ email }).select('+password');
+    if (!user || !(await bcrypt.compare(password, user.password || ''))) {
+      return res.status(401).json({ success: false, error: 'Invalid email or password.' });
+    }
+    const token = signToken(user);
+    return res.json({ success: true, token, user: userJson(user) });
+  } catch (err) {
+    return next(err);
   }
-  const user = await User.findOne({ email }).select('+password');
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    return res.status(401).json({ success: false, error: 'Invalid email or password.' });
-  }
-  const token = signToken(user);
-  return res.json({ success: true, token, user: userJson(user) });
 });
 
 router.get('/me', requireAuth, async (req, res) => {
