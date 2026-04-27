@@ -1,3 +1,4 @@
+import os from 'node:os';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -16,7 +17,7 @@ const router = express.Router();
 router.use(processTimingMiddleware);
 router.use(requireAuth);
 
-const uploadsDir = path.join(process.cwd(), 'uploads');
+const uploadsDir = path.join(os.tmpdir(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
