@@ -7,7 +7,6 @@ import mongoose from 'mongoose';
 import multer from 'multer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
 import { applyReceiptValidation } from '../lib/receiptValidation.js';
 import { Receipt } from '../models/Receipt.js';
 import { processTimingMiddleware } from '../middleware/processTiming.js';
@@ -16,6 +15,12 @@ import { requireAuth } from '../middleware/requireAuth.js';
 const router = express.Router();
 router.use(processTimingMiddleware);
 router.use(requireAuth);
+
+/** Tesseract in Node loads WASM; on serverless that often adds 15–30s+ per cold request. Set RECEIPT_TESSERACT=1 to enable (e.g. local). Vision-only (Gemini image) is the default. */
+function receiptTesseractEnabled() {
+  const v = (process.env.RECEIPT_TESSERACT || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
 
 const uploadsDir = path.join(os.tmpdir(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -51,6 +56,13 @@ const geminiModelId = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const RAW_TEXT_MAX = 32_000;
+function capRawText(s) {
+  if (typeof s !== 'string' || !s) return '';
+  if (s.length <= RAW_TEXT_MAX) return s;
+  return `${s.slice(0, RAW_TEXT_MAX)}\n…`;
 }
 
 /** Retries on Google’s transient overload (503) and rate limits (429). */
@@ -184,6 +196,7 @@ function ocrMeaningfulCharCount(s) {
 
 /** PSM 6 / 4 / 11 on one worker; pick best by mean confidence, then alphanumeric density, then length. */
 async function runReceiptOcr(ocrPath) {
+  const Tesseract = (await import('tesseract.js')).default;
   const psms = [
     Tesseract.PSM.SINGLE_BLOCK,
     Tesseract.PSM.SINGLE_COLUMN,
@@ -249,6 +262,31 @@ function imageMimeType(file) {
   return map[ext] || 'image/jpeg';
 }
 
+/** Downscale for Gemini. Full-resolution phone photos bloat the request and can exceed serverless time limits. */
+const GEMINI_MAX_EDGE = 1920;
+
+async function getGeminiInlineData(filePath, fileMeta) {
+  const fallbackMime = imageMimeType(fileMeta);
+  try {
+    const out = await sharp(filePath)
+      .rotate()
+      .resize(GEMINI_MAX_EDGE, GEMINI_MAX_EDGE, {
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 88, mozjpeg: true })
+      .toBuffer();
+    return { mimeType: 'image/jpeg', data: out.toString('base64') };
+  } catch {
+    try {
+      const buf = await fsp.readFile(filePath);
+      return { mimeType: fallbackMime, data: buf.toString('base64') };
+    } catch {
+      return null;
+    }
+  }
+}
+
 async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
@@ -261,12 +299,8 @@ async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
     };
   }
 
-  const mimeType = imageMimeType(fileMeta);
-  let imageBase64;
-  try {
-    const buf = await fsp.readFile(filePath);
-    imageBase64 = buf.toString('base64');
-  } catch {
+  const inline = await getGeminiInlineData(filePath, fileMeta);
+  if (!inline) {
     return {
       ok: false,
       error: 'Could not read uploaded image for AI parsing.',
@@ -274,6 +308,7 @@ async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
       retryable: true,
     };
   }
+  const { mimeType, data: imageBase64 } = inline;
 
   const prompt = `You analyze a receipt. Your input is (1) the receipt IMAGE and (2) OCR raw text below.
 
@@ -310,6 +345,7 @@ Output rules:
 - If the receipt prints a SUBTOTAL that equals the sum of product lines above it, omit SUBTOTAL from "items" (do not double-count). Always include the grand TOTAL in the "total" field, not as a duplicate line unless it is the only way it appears.
 - Do not invent prices.
 - confidence / confidence_flag: optional; the server recomputes them using vendor +30, date +30, total +40, +5 when line prices match total, then caps if validation fails.
+- receiptText: a single string of **all legible printed text** from the image, top to bottom (store name, line labels, numbers, tax lines). For audit/search. When there is no separate OCR hint, this is the only plain-text copy of the receipt.
 
 JSON shape:
 {
@@ -320,17 +356,15 @@ JSON shape:
   "tax": number | null,
   "items": [ { "name": "string", "price": number | null } ],
   "confidence": number,
-  "confidence_flag": "auto" | "review"
+  "confidence_flag": "auto" | "review",
+  "receiptText": "string"
 }
 
 OCR raw text (hint only; may contain errors):
 ${JSON.stringify(rawText)}`;
 
   const imagePart = {
-    inlineData: {
-      mimeType,
-      data: imageBase64,
-    },
+    inlineData: { mimeType, data: imageBase64 },
   };
 
   let responseText;
@@ -418,19 +452,25 @@ router.post(
     let tempFile = null;
 
     try {
-      const prep = await prepareImageForOcr(filePath);
-      const { ocrPath } = prep;
-      tempFile = prep.tempFile;
-
       let rawText = '';
       let ocrFailed = true;
-      try {
-        const ocr = await runReceiptOcr(ocrPath);
-        rawText = typeof ocr.rawText === 'string' ? ocr.rawText : '';
-        ocrFailed = Boolean(ocr.ocrFailed);
-      } catch {
+
+      if (receiptTesseractEnabled()) {
+        const prep = await prepareImageForOcr(filePath);
+        const { ocrPath } = prep;
+        tempFile = prep.tempFile;
+        try {
+          const ocr = await runReceiptOcr(ocrPath);
+          rawText = typeof ocr.rawText === 'string' ? ocr.rawText : '';
+          ocrFailed = Boolean(ocr.ocrFailed);
+        } catch {
+          rawText = '';
+          ocrFailed = true;
+        }
+      } else {
+        // Gemini prompt uses the image as primary; OCR is optional hardening only.
         rawText = '';
-        ocrFailed = true;
+        ocrFailed = false;
       }
 
       const gemini = await parseReceiptWithGemini(rawText, filePath, req.file);
@@ -469,8 +509,16 @@ router.post(
       }
 
       const { aiData } = gemini;
+      const visionTranscript =
+        typeof aiData.receiptText === 'string'
+          ? String(aiData.receiptText).trim()
+          : '';
+      delete aiData.receiptText;
+      const ocrOrHint = String(rawText || '').trim();
+      const combinedRaw = capRawText(ocrOrHint || visionTranscript);
+
       const receiptId = await createReceiptDraft(req.auth.userId, {
-        rawText,
+        rawText: combinedRaw,
         aiData,
         aiParseFailed: false,
         needsReview: aiData.confidence_flag === 'review',
@@ -478,7 +526,7 @@ router.post(
       return res.json(
         receiptJson({
           success: true,
-          rawText,
+          rawText: combinedRaw,
           aiParseFailed: false,
           aiData,
           ocrFailed,
