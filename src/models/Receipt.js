@@ -4,6 +4,8 @@ const receiptItemSchema = new mongoose.Schema(
   {
     name: { type: String, default: '' },
     price: { type: Number, default: null },
+    qty: { type: Number, default: null },
+    unitPrice: { type: Number, default: null },
   },
   { _id: false },
 );

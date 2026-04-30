@@ -33,7 +33,7 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Query: `from`, `to` (YYYY-MM-DD on `createdAt`), `vendor` (substring on `finalData.vendor`). */
+/** Query: `from`, `to` (YYYY-MM-DD on `createdAt`), `vendor` (substring on `finalData.vendor`), `confidenceFlag` (`auto` | `review`). */
 function buildExpenseFilter(query) {
   const filter = {};
   const from = typeof query.from === 'string' ? query.from.trim() : '';
@@ -51,6 +51,11 @@ function buildExpenseFilter(query) {
   const vendor = typeof query.vendor === 'string' ? query.vendor.trim() : '';
   if (vendor.length > 0) {
     filter['finalData.vendor'] = new RegExp(escapeRegex(vendor), 'i');
+  }
+  const cf =
+    typeof query.confidenceFlag === 'string' ? query.confidenceFlag.trim().toLowerCase() : '';
+  if (cf === 'auto' || cf === 'review') {
+    filter.confidenceFlag = cf;
   }
   return filter;
 }
