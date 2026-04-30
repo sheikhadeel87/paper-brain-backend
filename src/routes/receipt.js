@@ -41,12 +41,13 @@ const upload = multer({
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
     const mime = (file.mimetype || '').toLowerCase();
-    const okMime = mime === 'image/jpeg' || mime === 'image/png';
-    const okExt = ['.jpg', '.jpeg', '.png'].includes(ext);
+    const okMime =
+      mime === 'image/jpg' || mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp';
+    const okExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
     if (okMime || okExt) {
       cb(null, true);
     } else {
-      cb(new Error('Only JPEG and PNG images are supported.'));
+      cb(new Error('Only JPG,JPEG, PNG, and WebP images are supported.'));
     }
   },
 });
@@ -105,6 +106,11 @@ function mapAiToReceiptFields(aiData) {
     dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)
       ? new Date(`${dateStr}T12:00:00.000Z`)
       : null;
+  const numOrNull = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isNaN(n) ? null : n;
+  };
   const items =
     Array.isArray(aiData.items) && aiData.items.length > 0
       ? aiData.items.map((i) => ({
@@ -113,6 +119,8 @@ function mapAiToReceiptFields(aiData) {
             i?.price === null || i?.price === undefined || Number.isNaN(Number(i.price))
               ? null
               : Number(i.price),
+          qty: numOrNull(i?.qty),
+          unitPrice: numOrNull(i?.unitPrice),
         }))
       : [];
   const total =
@@ -341,7 +349,10 @@ Output rules:
 - date: YYYY-MM-DD from the printed date on the image when possible; otherwise best effort from OCR; if none exists, use "1970-01-01".
 - total and tax: numbers from the receipt image when printed.
 - currency: ISO-style string when possible (e.g. USD); otherwise from symbol on the image.
-- items: one object per clearly visible charge row (products, delivery/service fees, tips, tax lines when printed with an amount). "name" = text as printed (minor cleanup only). "price" = numeric line price from the image for that row, or null if no price is visible for that row.
+- items: one object per clearly visible charge row (products, delivery/service fees, tips, tax lines when printed with an amount). "name" = text as printed (minor cleanup only).
+- For each item, "price" is always the **line amount** for that row: the value in an Amount / Total / Extended price column, or the only price printed on that line when there is no separate unit column.
+- When the receipt row clearly shows **quantity** and **unit price** (or rate) as separate columns from the line amount, also set "qty" and "unitPrice" (numbers). If those columns are absent or unreadable, set "qty" and "unitPrice" to null — do not copy the line amount into "unitPrice".
+- When qty and unitPrice are both set, "price" should still match the printed line amount (or qty × unitPrice if that equals the printed amount).
 - If the receipt prints a SUBTOTAL that equals the sum of product lines above it, omit SUBTOTAL from "items" (do not double-count). Always include the grand TOTAL in the "total" field, not as a duplicate line unless it is the only way it appears.
 - Do not invent prices.
 - confidence / confidence_flag: optional; the server recomputes them using vendor +30, date +30, total +40, +5 when line prices match total, then caps if validation fails.
@@ -354,7 +365,7 @@ JSON shape:
   "total": number,
   "currency": "string",
   "tax": number | null,
-  "items": [ { "name": "string", "price": number | null } ],
+  "items": [ { "name": "string", "price": number | null, "qty": number | null, "unitPrice": number | null } ],
   "confidence": number,
   "confidence_flag": "auto" | "review",
   "receiptText": "string"

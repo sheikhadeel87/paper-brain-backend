@@ -144,7 +144,9 @@ function hasMeaningfulDate(date) {
 function hasMeaningfulTotal(total) {
   if (total === undefined || total === null || total === '') return false;
   const n = Number(total);
-  return !Number.isNaN(n) && Number.isFinite(n);
+  if (Number.isNaN(n) || !Number.isFinite(n)) return false;
+  /** Zero is not a real receipt total for scoring — avoids +40 when UI shows $0.00 with no data. */
+  return n > 0;
 }
 
 /**
