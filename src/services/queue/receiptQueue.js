@@ -11,7 +11,7 @@ export const receiptQueueEnabled =
 
 export const receiptQueue = receiptQueueEnabled
   ? new Queue('receipt-processing', {
-      connection: createBullmqRedisConnection(),
+      connection: createBullmqRedisConnection('queue'),
       defaultJobOptions: {
         attempts: 3,
         backoff: {
