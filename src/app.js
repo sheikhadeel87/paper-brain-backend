@@ -1,9 +1,10 @@
-import './bootEnv.js';
+import './bootEnv.js'
 import express from 'express';
 import cors from 'cors';
 import { connectMongo } from './lib/mongoConnect.js';
 import authRoutes from './routes/auth.js';
 import receiptRoutes from './routes/receipt.js';
+import './services/queue/receiptWorker.js';
 import expenseRoutes from './routes/expenses.js';
 
 const app = express();

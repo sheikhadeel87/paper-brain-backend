@@ -109,10 +109,29 @@ export function normalizeCurrency(currency) {
     $: 'USD',
     USD: 'USD',
     usd: 'USD',
+    'A$': 'AUD',
+    'AU$': 'AUD',
+    'C$': 'CAD',
+    'S$': 'SGD',
+    'HK$': 'HKD',
+    'NZ$': 'NZD',
   };
   if (map[s] !== undefined) return map[s];
   const lower = s.toLowerCase();
   if (lower === 'usd') return 'USD';
+  // Store valid ISO 4217 codes in uppercase (chf, pkr, aud, …) for consistent grouping / CSV.
+  if (/^[A-Za-z]{3}$/.test(s)) {
+    const upper = s.toUpperCase();
+    try {
+      new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: upper,
+      }).format(0);
+      return upper;
+    } catch {
+      return s;
+    }
+  }
   return s;
 }
 

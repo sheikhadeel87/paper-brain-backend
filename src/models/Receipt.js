@@ -32,6 +32,8 @@ const receiptSchema = new mongoose.Schema(
     items: { type: [receiptItemSchema], default: [] },
     rawText: { type: String, default: '' },
     confidence: { type: Number, default: 0 },
+    /** Shown in the app when totals do not reconcile or the worker flagged the draft. */
+    reviewHint: { type: String, default: '' },
     needsReview: { type: Boolean, default: true },
     /** True when structured AI parsing failed; row still has OCR rawText. */
     aiParseFailed: { type: Boolean, default: false },
