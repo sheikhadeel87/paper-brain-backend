@@ -7,7 +7,7 @@ let connection = null
 
 export const receiptWorker = receiptQueueEnabled
   ? (() => {
-      connection = createBullmqRedisConnection()
+      connection = createBullmqRedisConnection('worker')
       return new Worker(
         'receipt-processing',
         async (job) => {
@@ -40,13 +40,6 @@ if (receiptWorker) {
 
   receiptWorker.on('error', (err) => {
     console.error('[receiptWorker] worker error:', err?.message || err)
-  })
-
-  connection.on('error', (err) => {
-    console.error(
-      '[receiptWorker] redis connection error:',
-      err?.message || err,
-    )
   })
 
   receiptWorker.on('ready', () => {
