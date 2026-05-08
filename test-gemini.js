@@ -1,16 +1,19 @@
 import './src/bootEnv.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { getGeminiApiKeys } from './src/lib/geminiApiKeyPool.js';
 
 const modelId = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
 
 async function testGemini() {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey) {
-    console.error('❌ GEMINI_API_KEY is missing (.env at repo root or backend/.env)');
+  const keys = getGeminiApiKeys();
+  if (keys.length === 0) {
+    console.error(
+      '❌ No Gemini keys (set GEMINI_API_KEY comma-separated or GEMINI_API_KEYS in .env)',
+    );
     process.exit(1);
   }
-
-  console.log('Using model:', modelId);
+  const apiKey = keys[0];
+  console.log(`Using first of ${keys.length} key(s), model:`, modelId);
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);

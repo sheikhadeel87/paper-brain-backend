@@ -417,7 +417,7 @@ router.patch('/:id', async (req, res) => {
           status: v.status,
         },
       },
-      { new: true, runValidators: true },
+      { returnDocument: 'after', runValidators: true },
     ).lean();
 
     if (!expense) {
