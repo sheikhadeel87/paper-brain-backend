@@ -1,67 +1,85 @@
 import './bootEnv.js'
-import express from 'express';
-import cors from 'cors';
-import { connectMongo } from './lib/mongoConnect.js';
-import authRoutes from './routes/auth.js';
-import receiptRoutes from './routes/receipt.js';
-import './services/queue/receiptWorker.js';
-import expenseRoutes from './routes/expenses.js';
+import express from 'express'
+import cors from 'cors'
+import { connectMongo } from './lib/mongoConnect.js'
+import authRoutes from './routes/auth.js'
+import receiptRoutes from './routes/receipt.js'
+import './services/queue/receiptWorker.js'
+import expenseRoutes from './routes/expenses.js'
 
-const app = express();
+const app = express()
 
 const allowedOrigins = String(process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
-  .filter(Boolean);
+  .filter(Boolean)
 
-app.use(
-  cors({
-    exposedHeaders: ['X-Process-Time-Ms'],
-    origin:
-      allowedOrigins.length === 0
-        ? true
-        : (origin, cb) => {
-            if (!origin) return cb(null, true);
-            if (allowedOrigins.includes(origin)) return cb(null, true);
-            return cb(null, false);
-          },
-  }),
-);
-app.use(express.json());
+/** Always allow these (Vercel alpha + Vite dev). */
+const builtInAllowList = new Set([
+  'https://paper-brain-alpha.vercel.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://localhost:5173',
+  'https://127.0.0.1:5173',
+])
+
+function corsOrigin(origin, cb) {
+  if (!origin) return cb(null, true)
+  if (allowedOrigins.includes('*')) return cb(null, true)
+  if (builtInAllowList.has(origin)) return cb(null, true)
+  if (allowedOrigins.includes(origin)) return cb(null, true)
+  try {
+    const { hostname } = new URL(origin)
+    if (hostname.endsWith('.vercel.app')) return cb(null, true)
+  } catch {
+    return cb(null, false)
+  }
+  return cb(null, false)
+}
+
+const corsOptions = {
+  exposedHeaders: ['X-Process-Time-Ms'],
+  origin: corsOrigin,
+}
+
+// Express 5 / path-to-regexp rejects `app.options('*', …)` — bare `*` is invalid.
+// `app.use(cors(...))` still answers OPTIONS preflight for cross-origin requests.
+app.use(cors(corsOptions))
+app.use(express.json())
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK' });
-});
+  res.json({ status: 'OK' })
+})
 
 // Vercel serverless: `server.js` is not the entry, so this runs Mongo before /api.
 app.use('/api', async (req, res, next) => {
   try {
-    await connectMongo();
-    next();
+    await connectMongo()
+    next()
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[mongo] connect failed:', msg);
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[mongo] connect failed:', msg)
     if (String(process.env.MONGO_URI || '').includes('mongodb+srv')) {
       console.error(
         'Atlas: Network Access, URL-encoded password in MONGO_URI, and cluster host must be correct.',
-      );
+      )
     }
     return res.status(503).json({
       success: false,
       error:
         'Database connection failed. Verify MONGO_URI and Atlas allowlist, then try again.',
-    });
+    })
   }
-});
+})
 
-app.use('/api/auth', authRoutes);
-app.use('/api/receipt', receiptRoutes);
-app.use('/api/expenses', expenseRoutes);
+app.use('/api/auth', authRoutes)
+app.use('/api/receipt', receiptRoutes)
+app.use('/api/expenses', expenseRoutes)
 
 // Vercel returns HTML "Internal Server Error" if nothing converts thrown errors to JSON
 app.use((err, req, res, next) => {
   if (res.headersSent) {
-    return next(err);
+    return next(err)
   }
   const status = err.status || err.statusCode || 500
   const message = err instanceof Error ? err.message : 'Server error'
@@ -75,4 +93,4 @@ app.use((err, req, res, next) => {
   })
 })
 
-export default app;
+export default app
