@@ -2,12 +2,22 @@ import { Queue } from 'bullmq'
 import { createBullmqRedisConnection } from './redisConnection.js'
 
 /**
- * Set `RECEIPT_USE_BULLMQ=0` or `RECEIPT_INLINE_ONLY=1` to skip Redis entirely:
- * `/upload-multiple` runs processing in the HTTP request (same as pre-queue behavior).
+ * BullMQ + Redis worker does not fit Vercel serverless well (no long-lived worker,
+ * cold starts, Redis from every region). On Vercel (`VERCEL=1`), the queue is **off**
+ * unless you explicitly set `RECEIPT_USE_BULLMQ=1` and configure Redis — same behavior
+ * as before Redis: `/upload-multiple` runs inline in the HTTP request.
+ *
+ * Elsewhere: set `RECEIPT_USE_BULLMQ=0` or `RECEIPT_INLINE_ONLY=1` to skip Redis.
  */
+const onVercel = process.env.VERCEL === '1'
+const bullMqExplicitOn = process.env.RECEIPT_USE_BULLMQ === '1'
+const bullMqExplicitOff = process.env.RECEIPT_USE_BULLMQ === '0'
+const inlineOnly = process.env.RECEIPT_INLINE_ONLY === '1'
+
 export const receiptQueueEnabled =
-  process.env.RECEIPT_USE_BULLMQ !== '0' &&
-  process.env.RECEIPT_INLINE_ONLY !== '1'
+  !bullMqExplicitOff &&
+  !inlineOnly &&
+  (!onVercel || bullMqExplicitOn)
 
 export const receiptQueue = receiptQueueEnabled
   ? new Queue('receipt-processing', {
