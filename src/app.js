@@ -1,4 +1,7 @@
 import './bootEnv.js'
+// Vercel file-tracing: pull these into the bundle graph from api/index.js → app.js (also used in receipt.js).
+import multer from 'multer'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import express from 'express'
 import cors from 'cors'
 import { connectMongo } from './lib/mongoConnect.js'
@@ -105,4 +108,5 @@ app.use((err, req, res, next) => {
   })
 })
 
+export { multer, GoogleGenerativeAI }
 export default app
