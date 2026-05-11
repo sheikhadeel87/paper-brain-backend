@@ -4,6 +4,7 @@
   "description": "paper-brain backend project",
   "main": "index.js",
   "scripts": {
+    "build": "node -e \"process.exit(0)\"",
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon src/server.js",
     "test:gemini": "node test-gemini.js",
