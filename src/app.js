@@ -38,12 +38,24 @@ function corsOrigin(origin, cb) {
 }
 
 const corsOptions = {
+  credentials: true,
   exposedHeaders: ['X-Process-Time-Ms'],
   origin: corsOrigin,
 }
 
-// Express 5 / path-to-regexp rejects `app.options('*', …)` — bare `*` is invalid.
-// `app.use(cors(...))` still answers OPTIONS preflight for cross-origin requests.
+// --- Middleware order: logging → OPTIONS (Express 5-safe) → cors → body parser → routes
+app.use((req, res, next) => {
+  console.log(`[${req.method}] Origin: ${req.headers.origin ?? '(none)'}`)
+  next()
+})
+
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    return cors(corsOptions)(req, res, next)
+  }
+  next()
+})
+
 app.use(cors(corsOptions))
 app.use(express.json())
 
