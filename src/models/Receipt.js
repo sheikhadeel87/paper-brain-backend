@@ -37,6 +37,17 @@ const receiptSchema = new mongoose.Schema(
     needsReview: { type: Boolean, default: true },
     /** True when structured AI parsing failed; row still has OCR rawText. */
     aiParseFailed: { type: Boolean, default: false },
+    /** Async pipeline: pending → processing → completed | failed. Omitted on legacy rows (treated as ready). */
+    processingStatus: {
+      type: String,
+      enum: ['pending', 'processing', 'completed', 'failed'],
+    },
+    /** Cloud-hosted image used for Gemini (async upload). */
+    imageUrl: { type: String, default: '' },
+    cloudinaryPublicId: { type: String, default: '' },
+    processingError: { type: String, default: '' },
+    /** Extra receipt drafts created from the same photo (multi-slip); primary row holds this list. */
+    linkedReceiptIds: [{ type: mongoose.Schema.Types.ObjectId }],
   },
   {
     timestamps: { createdAt: 'createdAt', updatedAt: false },

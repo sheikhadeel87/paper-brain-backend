@@ -4,11 +4,13 @@ import cors from 'cors'
 import { connectMongo } from './lib/mongoConnect.js'
 import authRoutes from './routes/auth.js'
 import expenseRoutes from './routes/expenses.js'
+import { serve } from 'inngest/express'
+import { inngest } from './inngest/client.js'
+import { processReceiptWorkflow } from './inngest/functions/processReceiptWorkflow.js'
 
 /**
- * Receipt routes import sharp, multer, Gemini, queue, etc. Lazy-load so Vercel cold
- * starts for /api/auth/* and /api/expenses/* never touch native/heavy deps (avoids
- * ERR_MODULE_NOT_FOUND on login when NFT omits packages from /var/task).
+ * Receipt routes import multer, Gemini, queue, etc. Lazy-load so Vercel cold starts
+ * for /api/auth/* and /api/expenses/* avoid pulling the full receipt stack.
  */
 let receiptRouterCache = null
 let receiptRouterLoading = null
@@ -105,6 +107,10 @@ app.use('/api', async (req, res, next) => {
 })
 
 app.use('/api/auth', authRoutes)
+app.use(
+  '/api/inngest',
+  serve({ client: inngest, functions: [processReceiptWorkflow] }),
+)
 app.use('/api/receipt', mountReceiptLazy)
 app.use('/api/expenses', expenseRoutes)
 
