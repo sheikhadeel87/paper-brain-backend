@@ -1,14 +1,31 @@
 import './bootEnv.js'
-// Vercel file-tracing: pull these into the bundle graph from api/index.js → app.js (also used in receipt.js).
-import multer from 'multer'
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import express from 'express'
 import cors from 'cors'
 import { connectMongo } from './lib/mongoConnect.js'
 import authRoutes from './routes/auth.js'
-import receiptRoutes from './routes/receipt.js'
-import './services/queue/receiptWorker.js'
 import expenseRoutes from './routes/expenses.js'
+
+/**
+ * Receipt routes import sharp, multer, Gemini, queue, etc. Lazy-load so Vercel cold
+ * starts for /api/auth/* and /api/expenses/* never touch native/heavy deps (avoids
+ * ERR_MODULE_NOT_FOUND on login when NFT omits packages from /var/task).
+ */
+let receiptRouterCache = null
+let receiptRouterLoading = null
+async function getReceiptRouter() {
+  if (receiptRouterCache) return receiptRouterCache
+  if (!receiptRouterLoading) {
+    receiptRouterLoading = import('./routes/receipt.js').then((m) => m.default)
+  }
+  receiptRouterCache = await receiptRouterLoading
+  return receiptRouterCache
+}
+
+function mountReceiptLazy(req, res, next) {
+  getReceiptRouter()
+    .then((router) => router(req, res, next))
+    .catch(next)
+}
 
 const app = express()
 
@@ -88,7 +105,7 @@ app.use('/api', async (req, res, next) => {
 })
 
 app.use('/api/auth', authRoutes)
-app.use('/api/receipt', receiptRoutes)
+app.use('/api/receipt', mountReceiptLazy)
 app.use('/api/expenses', expenseRoutes)
 
 // Vercel returns HTML "Internal Server Error" if nothing converts thrown errors to JSON
@@ -108,5 +125,4 @@ app.use((err, req, res, next) => {
   })
 })
 
-export { multer, GoogleGenerativeAI }
 export default app

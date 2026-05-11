@@ -4,7 +4,7 @@
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "functions": {
     "api/index.js": {
-      "includeFiles": "node_modules/{multer,@google/generative-ai}/**"
+      "includeFiles": "node_modules/{multer,@google/generative-ai,sharp,@img}/**"
     }
   }
 }

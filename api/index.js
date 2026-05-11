@@ -1,7 +1,6 @@
 /**
  * Vercel serverless entry for Express.
- * Importing `app` from `src/app.js` ensures dependency tracing includes `multer`
- * and the rest of the route tree from this project root (where `package.json` lives).
+ * Receipt routes are lazy-loaded from `app.js` so auth/health cold starts avoid sharp/native deps.
  */
 import app from '../src/app.js'
 

@@ -6,6 +6,11 @@ validateProductionEnv();
 
 const { default: app } = await import('./app.js');
 
+// BullMQ worker only on long-running Node (not Vercel serverless).
+if (process.env.VERCEL !== '1') {
+  await import('./services/queue/receiptWorker.js');
+}
+
 const PORT = process.env.PORT || 8000;
 
 if (!String(process.env.MONGO_URI || '').trim()) {
