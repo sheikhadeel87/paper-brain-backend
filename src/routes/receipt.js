@@ -6,8 +6,10 @@ import express from 'express';
 import mongoose from 'mongoose';
 import multer from 'multer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import sharp from 'sharp';
 import { applyReceiptValidation, validateTotals } from '../lib/receiptValidation.js';
+import { receiptAsyncPipelineEnabled } from '../lib/receiptAsyncEnv.js';
+import { uploadReceiptImageBuffer } from '../services/cloudinaryUpload.js';
+import { inngest } from '../inngest/client.js';
 import {
   advanceGeminiKeyIndexAfterQuota,
   advanceGeminiKeyIndexAfterSuccess,
@@ -43,21 +45,29 @@ const storage = multer.diskStorage({
   },
 });
 
+function receiptImageFileFilter(_req, file, cb) {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  const mime = (file.mimetype || '').toLowerCase();
+  const okMime =
+    mime === 'image/jpg' || mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp';
+  const okExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+  if (okMime || okExt) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only JPG,JPEG, PNG, and WebP images are supported.'));
+  }
+}
+
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase();
-    const mime = (file.mimetype || '').toLowerCase();
-    const okMime =
-      mime === 'image/jpg' || mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp';
-    const okExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
-    if (okMime || okExt) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only JPG,JPEG, PNG, and WebP images are supported.'));
-    }
-  },
+  fileFilter: receiptImageFileFilter,
+});
+
+const uploadMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: receiptImageFileFilter,
 });
 
 const MULTI_UPLOAD_MAX_FILES = 10;
@@ -439,7 +449,10 @@ function mapAiToReceiptFields(aiData) {
   };
 }
 
-export async function createReceiptDraft(userId, { rawText, aiData, aiParseFailed, needsReview, reviewHint = '' }) {
+export async function createReceiptDraft(
+  userId,
+  { rawText, aiData, aiParseFailed, needsReview, reviewHint = '', processingStatus } = {},
+) {
   const hint =
     typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
   const base = {
@@ -462,28 +475,39 @@ export async function createReceiptDraft(userId, { rawText, aiData, aiParseFaile
           items: [],
           confidence: 0,
         };
-  const doc = await Receipt.create({ ...base, ...fields });
+  const statusExtra =
+    processingStatus && ['pending', 'processing', 'completed', 'failed'].includes(processingStatus)
+      ? { processingStatus }
+      : {};
+  const doc = await Receipt.create({ ...base, ...fields, ...statusExtra });
   return doc._id.toString();
 }
 
-/** Temp PNG for Tesseract only; Gemini still uses the original upload path. */
+export async function createPendingReceiptPlaceholder(userId, { imageUrl, cloudinaryPublicId }) {
+  const doc = await Receipt.create({
+    user: new mongoose.Types.ObjectId(userId),
+    processingStatus: 'pending',
+    imageUrl: typeof imageUrl === 'string' ? imageUrl : '',
+    cloudinaryPublicId: typeof cloudinaryPublicId === 'string' ? cloudinaryPublicId : '',
+    rawText: '',
+    aiParseFailed: false,
+    needsReview: true,
+    reviewHint: '',
+    expense: null,
+    vendor: null,
+    total: null,
+    currency: 'USD',
+    date: null,
+    tax: null,
+    items: [],
+    confidence: 0,
+  });
+  return doc._id.toString();
+}
+
+/** Tesseract reads the original file (no server-side Sharp preprocessing). */
 export async function prepareImageForOcr(originalPath) {
-  const dir = path.dirname(originalPath);
-  const stem = path.basename(originalPath, path.extname(originalPath));
-  const outPath = path.join(dir, `${stem}-ocr.png`);
-  try {
-    await sharp(originalPath)
-      .rotate()
-      .grayscale()
-      .normalize()
-      .sharpen()
-      .threshold(150)
-      .png()
-      .toFile(outPath);
-    return { ocrPath: outPath, tempFile: outPath };
-  } catch {
-    return { ocrPath: originalPath, tempFile: null };
-  }
+  return { ocrPath: originalPath, tempFile: null };
 }
 
 function ocrMeaningfulCharCount(s) {
@@ -563,9 +587,6 @@ function imageMimeType(file) {
   return map[ext] || 'image/jpeg';
 }
 
-/** Downscale for Gemini. Full-resolution phone photos bloat the request and can exceed serverless time limits. */
-const GEMINI_MAX_EDGE = 1920;
-
 /** Max separate slips we create as Receipt drafts from one photo (cost + review UX). */
 const MAX_RECEIPTS_PER_IMAGE = 5;
 
@@ -594,26 +615,14 @@ function normalizeGeminiReceipts(parsed) {
 async function getGeminiInlineData(filePath, fileMeta) {
   const fallbackMime = imageMimeType(fileMeta);
   try {
-    const out = await sharp(filePath)
-      .rotate()
-      .resize(GEMINI_MAX_EDGE, GEMINI_MAX_EDGE, {
-        fit: 'inside',
-        withoutEnlargement: true,
-      })
-      .jpeg({ quality: 88, mozjpeg: true })
-      .toBuffer();
-    return { mimeType: 'image/jpeg', data: out.toString('base64') };
+    const buf = await fsp.readFile(filePath);
+    return { mimeType: fallbackMime, data: buf.toString('base64') };
   } catch {
-    try {
-      const buf = await fsp.readFile(filePath);
-      return { mimeType: fallbackMime, data: buf.toString('base64') };
-    } catch {
-      return null;
-    }
+    return null;
   }
 }
 
-export async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
+async function geminiVisionToReceipts(rawText, imagePart) {
   const keys = getGeminiApiKeys();
   if (keys.length === 0) {
     return {
@@ -625,18 +634,10 @@ export async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
     };
   }
 
-  const inline = await getGeminiInlineData(filePath, fileMeta);
-  if (!inline) {
-    return {
-      ok: false,
-      error: 'Could not read uploaded image for AI parsing.',
-      code: 'IMAGE_READ_FAILED',
-      retryable: true,
-    };
-  }
-  const { mimeType, data: imageBase64 } = inline;
-
   const prompt = `You analyze receipt image(s). Your input is (1) the receipt IMAGE and (2) OCR raw text below.
+
+If the image is blurry, not a receipt, or unreadable, return exactly this JSON object and nothing else:
+{"error":"UNREADABLE_IMAGE"}
 
 MULTI-RECEIPT: The same photo may contain **several separate paper receipts** (e.g. stacked or side by side). Each distinct slip (different store, different totals block, or clearly separate document) must become **one object** inside the top-level "receipts" array — never merge two real slips into one. If only one slip is visible, return exactly **one** object in "receipts". Return at most ${MAX_RECEIPTS_PER_IMAGE} receipts.
 
@@ -698,10 +699,6 @@ JSON shape (always use this wrapper):
 OCR raw text (hint only; may contain errors):
 ${JSON.stringify(rawText)}`;
 
-  const imagePart = {
-    inlineData: { mimeType, data: imageBase64 },
-  };
-
   const MAX_JSON_ATTEMPTS = 3;
 
   keyRotation: for (let kAttempt = 0; kAttempt < keys.length; kAttempt += 1) {
@@ -754,6 +751,14 @@ ${JSON.stringify(rawText)}`;
 
       try {
         const parsed = JSON.parse(cleaned);
+        if (parsed && typeof parsed === 'object' && parsed.error === 'UNREADABLE_IMAGE') {
+          return {
+            ok: false,
+            error: 'Image was unreadable.',
+            code: 'UNREADABLE_IMAGE',
+            retryable: false,
+          };
+        }
         const receipts = normalizeGeminiReceipts(parsed);
         if (receipts.length === 0) {
           throw new Error('empty receipts');
@@ -787,10 +792,246 @@ ${JSON.stringify(rawText)}`;
   };
 }
 
+export async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
+  let inline;
+  if (fileMeta?.buffer && Buffer.isBuffer(fileMeta.buffer)) {
+    inline = {
+      mimeType: imageMimeType(fileMeta),
+      data: fileMeta.buffer.toString('base64'),
+    };
+  } else if (filePath) {
+    inline = await getGeminiInlineData(filePath, fileMeta);
+  } else {
+    return {
+      ok: false,
+      error: 'Could not read uploaded image for AI parsing.',
+      code: 'IMAGE_READ_FAILED',
+      retryable: true,
+    };
+  }
+  if (!inline) {
+    return {
+      ok: false,
+      error: 'Could not read uploaded image for AI parsing.',
+      code: 'IMAGE_READ_FAILED',
+      retryable: true,
+    };
+  }
+  const imagePart = {
+    inlineData: { mimeType: inline.mimeType, data: inline.data },
+  };
+  return geminiVisionToReceipts(rawText, imagePart);
+}
+
+export async function parseReceiptWithGeminiFromUrl(rawText, imageUrl) {
+  const res = await fetch(String(imageUrl), { redirect: 'follow' });
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: `Could not fetch image (${res.status}).`,
+      code: 'IMAGE_FETCH_FAILED',
+      retryable: true,
+    };
+  }
+  const mimeHeader = res.headers.get('content-type') || 'image/jpeg';
+  const mimeType = mimeHeader.split(';')[0].trim() || 'image/jpeg';
+  const buf = Buffer.from(await res.arrayBuffer());
+  const imagePart = {
+    inlineData: { mimeType, data: buf.toString('base64') },
+  };
+  return geminiVisionToReceipts(rawText, imagePart);
+}
+
+export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId, gemini) {
+  const uid = new mongoose.Types.ObjectId(userId);
+  const rid = new mongoose.Types.ObjectId(pendingReceiptId);
+
+  if (!gemini || !gemini.ok) {
+    const errMsg =
+      gemini && typeof gemini.error === 'string' ? gemini.error : 'AI parse failed';
+    const code = gemini?.code || 'GEMINI_FAILED';
+    await Receipt.updateOne(
+      { _id: rid, user: uid },
+      {
+        $set: {
+          processingStatus: 'failed',
+          processingError: errMsg.slice(0, 2000),
+          aiParseFailed: true,
+          needsReview: true,
+        },
+      },
+    );
+    return { ok: false, receiptIds: [String(rid)], code };
+  }
+
+  const slips = gemini.receipts;
+  if (!Array.isArray(slips) || slips.length === 0) {
+    await Receipt.updateOne(
+      { _id: rid, user: uid },
+      {
+        $set: {
+          processingStatus: 'failed',
+          processingError: 'No receipts extracted',
+          aiParseFailed: true,
+          needsReview: true,
+        },
+      },
+    );
+    return { ok: false, receiptIds: [String(rid)], code: 'EMPTY_RECEIPTS' };
+  }
+
+  const createdIds = [];
+
+  for (let i = 0; i < slips.length; i += 1) {
+    const slip = { ...slips[i] };
+    const visionTranscript =
+      typeof slip.receiptText === 'string' ? String(slip.receiptText).trim() : '';
+    delete slip.receiptText;
+    const slipRaw = capRawText(visionTranscript);
+    const { needsReview, reviewHint } = computeReceiptDraftReview(slip);
+    const hint =
+      typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
+    const fields = mapAiToReceiptFields(slip);
+
+    if (i === 0) {
+      await Receipt.updateOne(
+        { _id: rid, user: uid },
+        {
+          $set: {
+            ...fields,
+            rawText: slipRaw,
+            aiParseFailed: false,
+            needsReview,
+            reviewHint: hint,
+            processingStatus: 'completed',
+            processingError: '',
+            linkedReceiptIds: [],
+          },
+        },
+      );
+      createdIds.push(String(rid));
+    } else {
+      const newId = await createReceiptDraft(userId, {
+        rawText: slipRaw,
+        aiData: slip,
+        aiParseFailed: false,
+        needsReview,
+        reviewHint: hint,
+        processingStatus: 'completed',
+      });
+      createdIds.push(String(newId));
+    }
+  }
+
+  if (createdIds.length > 1) {
+    const extras = createdIds.slice(1).map((id) => new mongoose.Types.ObjectId(id));
+    await Receipt.updateOne({ _id: rid, user: uid }, { $set: { linkedReceiptIds: extras } });
+  }
+
+  return { ok: true, receiptIds: createdIds };
+}
+
+router.get('/upload-status/:receiptId', async (req, res) => {
+  try {
+    const userId = req.auth?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+    const rid = String(req.params.receiptId || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(rid)) {
+      return res.status(400).json({ success: false, error: 'Invalid receipt id.' });
+    }
+    const primary = await Receipt.findOne({
+      _id: new mongoose.Types.ObjectId(rid),
+      user: new mongoose.Types.ObjectId(userId),
+    }).lean();
+    if (!primary) {
+      return res.status(404).json({ success: false, error: 'Receipt not found.' });
+    }
+
+    const status = primary.processingStatus || 'completed';
+    const out = {
+      success: true,
+      processingStatus: status,
+      receiptId: String(primary._id),
+    };
+
+    if (status === 'pending' || status === 'processing') {
+      return res.json(out);
+    }
+
+    if (status === 'failed') {
+      return res.json({
+        ...out,
+        error: primary.processingError || 'Processing failed',
+        aiParseFailed: Boolean(primary.aiParseFailed),
+      });
+    }
+
+    const linked = Array.isArray(primary.linkedReceiptIds) ? primary.linkedReceiptIds : [];
+    const ids = [primary._id, ...linked];
+    const rows = await Receipt.find({
+      _id: { $in: ids },
+      user: new mongoose.Types.ObjectId(userId),
+    })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const toAiShape = (row) => ({
+      vendor: row.vendor,
+      total: row.total,
+      currency: row.currency,
+      date: row.date,
+      tax: row.tax,
+      items: row.items,
+      confidence: row.confidence,
+    });
+
+    const created = rows.map((row) => {
+      const slip = toAiShape(row);
+      return {
+        receiptId: String(row._id),
+        aiData: slip,
+        rawText: typeof row.rawText === 'string' ? row.rawText : '',
+        reviewHint: typeof row.reviewHint === 'string' ? row.reviewHint : '',
+        needsReview: Boolean(row.needsReview),
+      };
+    });
+
+    const first = created[0];
+    const combinedRaw = capRawText(
+      created.map((c) => c.rawText).filter(Boolean).join('\n\n--- next receipt ---\n\n'),
+    );
+    const needsReviewAny = created.some((c) => c.needsReview);
+
+    return res.json({
+      ...out,
+      ...receiptJson({
+        success: true,
+        rawText: combinedRaw,
+        aiParseFailed: false,
+        aiData: first?.aiData,
+        ocrFailed: false,
+        needsReview: needsReviewAny,
+        receiptId: first?.receiptId,
+        receiptIds: created.map((c) => c.receiptId),
+        multiReceipt: created.length > 1,
+        receipts: created,
+      }),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Status failed';
+    return res.status(500).json({ success: false, error: message });
+  }
+});
+
 router.post(
   '/upload',
   (req, res, next) => {
-    upload.single('receipt')(req, res, (err) => {
+    const multerSingle = receiptAsyncPipelineEnabled()
+      ? uploadMemory.single('receipt')
+      : upload.single('receipt');
+    multerSingle(req, res, (err) => {
       if (err) {
         const msg = err instanceof Error ? err.message : 'Upload failed';
         return res.status(400).json(
@@ -818,10 +1059,58 @@ router.post(
     });
   },
   async (req, res) => {
-    const filePath = path.resolve(req.file.path);
+    const filePath = req.file.path ? path.resolve(req.file.path) : null;
     let tempFile = null;
 
     try {
+      if (receiptAsyncPipelineEnabled()) {
+        const buf = req.file.buffer;
+        if (!buf || !Buffer.isBuffer(buf)) {
+          return res.status(500).json(
+            receiptJson({
+              success: false,
+              error: 'Internal upload error (buffer missing).',
+              code: 'INTERNAL_ERROR',
+              rawText: '',
+              aiParseFailed: true,
+            }),
+          );
+        }
+        const userId = req.auth.userId;
+        const { url, publicId } = await uploadReceiptImageBuffer(buf, {
+          userId,
+          originalFilename: req.file.originalname,
+        });
+        const receiptId = await createPendingReceiptPlaceholder(userId, {
+          imageUrl: url,
+          cloudinaryPublicId: publicId,
+        });
+        await inngest.send({
+          name: 'receipt/uploaded',
+          data: { receiptId, imageUrl: url, userId: String(userId) },
+        });
+        return res.status(202).json({
+          success: true,
+          accepted: true,
+          processingStatus: 'pending',
+          receiptId,
+          pollUrl: `/api/receipt/upload-status/${receiptId}`,
+          message: 'Receipt queued for processing.',
+        });
+      }
+
+      if (!filePath) {
+        return res.status(500).json(
+          receiptJson({
+            success: false,
+            error: 'Upload path missing.',
+            code: 'INTERNAL_ERROR',
+            rawText: '',
+            aiParseFailed: true,
+          }),
+        );
+      }
+
       let rawText = '';
       let ocrFailed = true;
 
@@ -838,7 +1127,6 @@ router.post(
           ocrFailed = true;
         }
       } else {
-        // Gemini prompt uses the image as primary; OCR is optional hardening only.
         rawText = '';
         ocrFailed = false;
       }
@@ -947,7 +1235,7 @@ router.post(
         );
       }
     } finally {
-      await fsp.unlink(filePath).catch(() => {});
+      if (filePath) await fsp.unlink(filePath).catch(() => {});
       if (tempFile) await fsp.unlink(tempFile).catch(() => {});
     }
   },
