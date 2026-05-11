@@ -7,7 +7,6 @@ import mongoose from 'mongoose';
 import multer from 'multer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { applyReceiptValidation, validateTotals } from '../lib/receiptValidation.js';
-import { receiptAsyncPipelineEnabled } from '../lib/receiptAsyncEnv.js';
 import { uploadReceiptImageBuffer } from '../services/cloudinaryUpload.js';
 import { inngest } from '../inngest/client.js';
 import {
@@ -25,6 +24,16 @@ import { receiptQueue } from '../services/queue/receiptQueue.js'
 const router = express.Router();
 router.use(processTimingMiddleware);
 router.use(requireAuth);
+
+/** Cloudinary + Inngest event key: enables 202 async receipt processing (inline so Vercel NFT always ships this file with receipt.js). */
+function receiptAsyncPipelineEnabled() {
+  const cloud =
+    Boolean(String(process.env.CLOUDINARY_URL || '').trim()) ||
+    (Boolean(String(process.env.CLOUDINARY_CLOUD_NAME || '').trim()) &&
+      Boolean(String(process.env.CLOUDINARY_API_KEY || '').trim()) &&
+      Boolean(String(process.env.CLOUDINARY_API_SECRET || '').trim()));
+  return cloud && Boolean(String(process.env.INNGEST_EVENT_KEY || '').trim());
+}
 
 /** Tesseract in Node loads WASM; on serverless that often adds 15–30s+ per cold request. Set RECEIPT_TESSERACT=1 to enable (e.g. local). Vision-only (Gemini image) is the default. */
 export function receiptTesseractEnabled() {
