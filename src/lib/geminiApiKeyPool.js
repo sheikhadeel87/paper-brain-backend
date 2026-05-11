@@ -1,6 +1,7 @@
 /**
  * Rotating pool of Gemini API keys (comma-separated GEMINI_API_KEY or GEMINI_API_KEYS).
  * Global index advances on quota/429 so the same exhausted key is not reused immediately.
+ * API Key Rotation or Failover Strategy.
  */
 
 let geminiKeyIndex = 0
