@@ -1,9 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm install",
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "functions": {
     "api/index.js": {
-      "includeFiles": "node_modules/multer/**"
+      "includeFiles": [
+        "node_modules/multer/**",
+        "node_modules/@google/generative-ai/**"
+      ]
     }
   }
 }
