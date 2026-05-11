@@ -60,6 +60,6 @@ if (receiptWorker) {
     })
 } else {
   console.log(
-    '[receiptWorker] BullMQ worker not started (RECEIPT_USE_BULLMQ=0 or RECEIPT_INLINE_ONLY=1). Use inline upload processing.',
+    '[receiptWorker] BullMQ worker not started — receipt uploads run inline in HTTP (Vercel default, or RECEIPT_USE_BULLMQ=0 / RECEIPT_INLINE_ONLY=1). Set RECEIPT_USE_BULLMQ=1 with Redis on a long-running host to use the queue.',
   )
 }
