@@ -7,8 +7,7 @@ import mongoose from 'mongoose';
 import multer from 'multer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { applyReceiptValidation, validateTotals } from '../lib/receiptValidation.js';
-import { uploadReceiptImageBuffer } from '../services/cloudinaryUpload.js';
-import { inngest } from '../inngest/client.js';
+import { uploadReceiptImageBuffer, isCloudinaryConfigured } from '../services/cloudinaryUpload.js';
 import {
   advanceGeminiKeyIndexAfterQuota,
   advanceGeminiKeyIndexAfterSuccess,
@@ -17,22 +16,29 @@ import {
   peekGeminiKeyIndex,
 } from '../lib/geminiApiKeyPool.js';
 import { Receipt } from '../models/Receipt.js';
+import { ReceiptUploadJob } from '../models/ReceiptUploadJob.js';
 import { processTimingMiddleware } from '../middleware/processTiming.js';
 import { requireAuth } from '../middleware/requireAuth.js';
-import { receiptQueue } from '../services/queue/receiptQueue.js'
+import { receiptQueue } from '../services/queue/receiptQueue.js';
+import { enqueueReceiptUploadJobs } from '../services/queue/receiptFlowEnqueue.js';
+import { getReceiptWorkerConcurrency } from '../services/queue/receiptWorkerConcurrency.js';
 
 const router = express.Router();
 router.use(processTimingMiddleware);
 router.use(requireAuth);
 
-/** Cloudinary + Inngest event key: enables 202 async receipt processing (inline so Vercel NFT always ships this file with receipt.js). */
+/** Cloudinary + (BullMQ queue **or** Inngest): used for config / UX hints. */
 function receiptAsyncPipelineEnabled() {
-  const cloud =
-    Boolean(String(process.env.CLOUDINARY_URL || '').trim()) ||
-    (Boolean(String(process.env.CLOUDINARY_CLOUD_NAME || '').trim()) &&
-      Boolean(String(process.env.CLOUDINARY_API_KEY || '').trim()) &&
-      Boolean(String(process.env.CLOUDINARY_API_SECRET || '').trim()));
-  return cloud && Boolean(String(process.env.INNGEST_EVENT_KEY || '').trim());
+  return (
+    isCloudinaryConfigured() &&
+    (Boolean(receiptQueue) ||
+      Boolean(String(process.env.INNGEST_EVENT_KEY || '').trim()))
+  );
+}
+
+/** Single-file 202 async path: Cloudinary + Redis Bull queue only (Receipt created in worker). */
+function receiptBullAsyncUploadEnabled() {
+  return isCloudinaryConfigured() && Boolean(receiptQueue);
 }
 
 /** Tesseract in Node loads WASM; on serverless that often adds 15–30s+ per cold request. Set RECEIPT_TESSERACT=1 to enable (e.g. local). Vision-only (Gemini image) is the default. */
@@ -112,18 +118,17 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
 
     if (receiptQueue) {
       try {
-        const queuedJobs = await receiptQueue.addBulk(jobs);
-        const jobIds = queuedJobs.map((j) => String(j.id));
+        const jobIds = await enqueueReceiptUploadJobs(jobs);
         return res.status(202).json({
           success: true,
           message: 'Receipts added to processing queue.',
-          count: queuedJobs.length,
+          count: jobIds.length,
           jobIds,
           fileNames,
         });
       } catch (queueErr) {
         console.warn(
-          '[receipt] BullMQ addBulk failed; processing uploads in this request instead:',
+          '[receipt] BullMQ enqueue failed; processing uploads in this request instead:',
           queueErr instanceof Error ? queueErr.message : queueErr,
         );
       }
@@ -148,7 +153,7 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
             fileName: name,
             userId,
           },
-          { applyMinSlot: i < files.length - 1 },
+          { applyMinSlot: true },
         );
         completed += 1;
         results.push({
@@ -284,12 +289,34 @@ router.get('/jobs-status', async (req, res) => {
       jobs.push(row);
     }
 
+    /**
+     * Poll-friendly FIFO: `ids` order is queue order. BullMQ may show multiple `active`
+     * jobs (several workers) or mix `active` with `prioritized`. Only the first “runner”
+     * keeps its state; later runners are returned as `waiting` so Network/UI show one
+     * process at a time (Run 1, Wait N−1).
+     */
+    const fifoRunner = (s) => s === 'active' || s === 'prioritized';
+    const jobsOut = [];
+    let fifoRunSlotUsed = false;
+    for (const row of jobs) {
+      if (fifoRunner(row.state)) {
+        if (!fifoRunSlotUsed) {
+          fifoRunSlotUsed = true;
+          jobsOut.push(row);
+        } else {
+          jobsOut.push({ ...row, state: 'waiting' });
+        }
+      } else {
+        jobsOut.push(row);
+      }
+    }
+
     let completed = 0;
     let failed = 0;
     let processing = 0;
     let waiting = 0;
-    for (const row of jobs) {
-      if (row.state === 'active') {
+    for (const row of jobsOut) {
+      if (row.state === 'active' || row.state === 'prioritized') {
         processing += 1;
       } else if (row.state === 'failed') {
         failed += 1;
@@ -298,12 +325,18 @@ router.get('/jobs-status', async (req, res) => {
       } else if (
         row.state === 'waiting' ||
         row.state === 'delayed' ||
+        row.state === 'waiting-children' ||
         row.state === 'paused'
       ) {
         waiting += 1;
       } else {
         waiting += 1;
       }
+    }
+
+    if (processing > 1) {
+      waiting += processing - 1;
+      processing = 1;
     }
 
     const summary = {
@@ -317,7 +350,7 @@ router.get('/jobs-status', async (req, res) => {
     return res.json({
       success: true,
       summary,
-      jobs,
+      jobs: jobsOut,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Job status failed';
@@ -333,6 +366,35 @@ function parseReceiptDraftsQuery(query) {
   return { limit, skip };
 }
 
+/** Debug: whether this deployment will use async (202) vs sync upload — no secrets exposed. */
+router.get('/processing-config', async (req, res) => {
+  try {
+    if (!req.auth?.userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+    const cloud = isCloudinaryConfigured();
+    const inngestKey = Boolean(String(process.env.INNGEST_EVENT_KEY || '').trim());
+    const bullMq = Boolean(receiptQueue);
+    const asyncOn = receiptAsyncPipelineEnabled();
+    return res.json({
+      success: true,
+      asyncUploadEnabled: asyncOn,
+      bullMqReceiptQueueEnabled: bullMq,
+      cloudinaryConfigured: cloud,
+      inngestEventKeyConfigured: inngestKey,
+      receiptWorkerConcurrency: getReceiptWorkerConcurrency(),
+      hint: receiptBullAsyncUploadEnabled()
+        ? 'Single-file async upload uses BullMQ: set REDIS_URL and RECEIPT_USE_BULLMQ=1; run a worker (not Vercel serverless) so jobs complete.'
+        : asyncOn
+          ? 'For async (202) single uploads without BullMQ, configure Redis + RECEIPT_USE_BULLMQ=1, or use INNGEST_EVENT_KEY for other flows.'
+          : 'Set CLOUDINARY_URL (or CLOUDINARY_CLOUD_NAME + API_KEY + API_SECRET). For queued single uploads add Redis + RECEIPT_USE_BULLMQ=1.',
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Config failed';
+    return res.status(500).json({ success: false, error: message });
+  }
+});
+
 /** Receipt rows for this account (including linked + pending). */
 router.get('/drafts', async (req, res) => {
   try {
@@ -343,6 +405,8 @@ router.get('/drafts', async (req, res) => {
     const { limit, skip } = parseReceiptDraftsQuery(req.query);
     const filter = {
       user: new mongoose.Types.ObjectId(userId),
+      /** Omit in-flight async rows; BullMQ path creates Receipt only after Gemini (no pending rows). */
+      processingStatus: { $nin: ['pending', 'processing'] },
     };
     const [receipts, totalCount] = await Promise.all([
       Receipt.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
@@ -489,28 +553,6 @@ export async function createReceiptDraft(
       ? { processingStatus }
       : {};
   const doc = await Receipt.create({ ...base, ...fields, ...statusExtra });
-  return doc._id.toString();
-}
-
-export async function createPendingReceiptPlaceholder(userId, { imageUrl, cloudinaryPublicId }) {
-  const doc = await Receipt.create({
-    user: new mongoose.Types.ObjectId(userId),
-    processingStatus: 'pending',
-    imageUrl: typeof imageUrl === 'string' ? imageUrl : '',
-    cloudinaryPublicId: typeof cloudinaryPublicId === 'string' ? cloudinaryPublicId : '',
-    rawText: '',
-    aiParseFailed: false,
-    needsReview: true,
-    reviewHint: '',
-    expense: null,
-    vendor: null,
-    total: null,
-    currency: 'USD',
-    date: null,
-    tax: null,
-    items: [],
-    confidence: 0,
-  });
   return doc._id.toString();
 }
 
@@ -940,6 +982,198 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
   return { ok: true, receiptIds: createdIds };
 }
 
+export async function markReceiptUploadJobFailed(userId, jobId, processingError) {
+  const uid = new mongoose.Types.ObjectId(userId);
+  await ReceiptUploadJob.updateOne(
+    { jobId: String(jobId), user: uid },
+    {
+      $set: {
+        status: 'failed',
+        processingError: String(processingError || 'Processing failed').slice(0, 2000),
+      },
+    },
+  );
+}
+
+export async function persistAsyncReceiptUploadJob(
+  jobId,
+  userId,
+  gemini,
+  { imageUrl, cloudinaryPublicId },
+) {
+  const uid = new mongoose.Types.ObjectId(userId);
+  const job = await ReceiptUploadJob.findOne({ jobId: String(jobId), user: uid });
+  if (!job) {
+    return { ok: false, receiptIds: [], code: 'JOB_NOT_FOUND' };
+  }
+
+  const markFailed = async (processingError, code) => {
+    await ReceiptUploadJob.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: 'failed',
+          processingError: String(processingError || '').slice(0, 2000),
+        },
+      },
+    );
+    return { ok: false, receiptIds: [], code };
+  };
+
+  if (!gemini || !gemini.ok) {
+    const errMsg =
+      gemini && typeof gemini.error === 'string' ? gemini.error : 'AI parse failed';
+    const code = gemini?.code || 'GEMINI_FAILED';
+    return markFailed(errMsg, code);
+  }
+
+  const slips = gemini.receipts;
+  if (!Array.isArray(slips) || slips.length === 0) {
+    return markFailed('No receipts extracted', 'EMPTY_RECEIPTS');
+  }
+
+  const createdIds = [];
+  const img = typeof imageUrl === 'string' ? imageUrl : '';
+  const cid = typeof cloudinaryPublicId === 'string' ? cloudinaryPublicId : '';
+
+  for (let i = 0; i < slips.length; i += 1) {
+    const slip = { ...slips[i] };
+    const visionTranscript =
+      typeof slip.receiptText === 'string' ? String(slip.receiptText).trim() : '';
+    delete slip.receiptText;
+    const slipRaw = capRawText(visionTranscript);
+    const { needsReview, reviewHint } = computeReceiptDraftReview(slip);
+    const hint =
+      typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
+    if (i === 0) {
+      const id = await createReceiptDraft(userId, {
+        rawText: slipRaw,
+        aiData: slip,
+        aiParseFailed: false,
+        needsReview,
+        reviewHint: hint,
+        processingStatus: 'completed',
+        imageUrl: img,
+        cloudinaryPublicId: cid,
+      });
+      createdIds.push(id);
+    } else {
+      const newId = await createReceiptDraft(userId, {
+        rawText: slipRaw,
+        aiData: slip,
+        aiParseFailed: false,
+        needsReview,
+        reviewHint: hint,
+        processingStatus: 'completed',
+      });
+      createdIds.push(newId);
+    }
+  }
+
+  if (createdIds.length > 1) {
+    const extras = createdIds.slice(1).map((id) => new mongoose.Types.ObjectId(id));
+    await Receipt.updateOne(
+      { _id: new mongoose.Types.ObjectId(createdIds[0]), user: uid },
+      { $set: { linkedReceiptIds: extras } },
+    );
+  }
+
+  await ReceiptUploadJob.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: 'completed',
+        resultReceiptId: new mongoose.Types.ObjectId(createdIds[0]),
+        processingError: '',
+      },
+    },
+  );
+
+  return { ok: true, receiptIds: createdIds };
+}
+
+function isReceiptStatusObjectIdParam(rid) {
+  return typeof rid === 'string' && /^[a-f0-9]{24}$/i.test(rid);
+}
+
+/** BullMQ default job ids are numeric strings (not 24-char ObjectIds). */
+function isBullMqNumericJobIdParam(rid) {
+  return typeof rid === 'string' && /^\d+$/.test(rid);
+}
+
+async function sendResolvedReceiptDraftStatus(res, userId, primary) {
+  const status = primary.processingStatus || 'completed';
+  const out = {
+    success: true,
+    processingStatus: status,
+    receiptId: String(primary._id),
+  };
+
+  if (status === 'pending' || status === 'processing') {
+    return res.json(out);
+  }
+
+  if (status === 'failed') {
+    return res.json({
+      ...out,
+      error: primary.processingError || 'Processing failed',
+      aiParseFailed: Boolean(primary.aiParseFailed),
+    });
+  }
+
+  const linked = Array.isArray(primary.linkedReceiptIds) ? primary.linkedReceiptIds : [];
+  const ids = [primary._id, ...linked];
+  const rows = await Receipt.find({
+    _id: { $in: ids },
+    user: new mongoose.Types.ObjectId(userId),
+  })
+    .sort({ createdAt: 1 })
+    .lean();
+
+  const toAiShape = (row) => ({
+    vendor: row.vendor,
+    total: row.total,
+    currency: row.currency,
+    date: row.date,
+    tax: row.tax,
+    items: row.items,
+    confidence: row.confidence,
+  });
+
+  const created = rows.map((row) => {
+    const slip = toAiShape(row);
+    return {
+      receiptId: String(row._id),
+      aiData: slip,
+      rawText: typeof row.rawText === 'string' ? row.rawText : '',
+      reviewHint: typeof row.reviewHint === 'string' ? row.reviewHint : '',
+      needsReview: Boolean(row.needsReview),
+    };
+  });
+
+  const first = created[0];
+  const combinedRaw = capRawText(
+    created.map((c) => c.rawText).filter(Boolean).join('\n\n--- next receipt ---\n\n'),
+  );
+  const needsReviewAny = created.some((c) => c.needsReview);
+
+  return res.json({
+    ...out,
+    ...receiptJson({
+      success: true,
+      rawText: combinedRaw,
+      aiParseFailed: false,
+      aiData: first?.aiData,
+      ocrFailed: false,
+      needsReview: needsReviewAny,
+      receiptId: first?.receiptId,
+      receiptIds: created.map((c) => c.receiptId),
+      multiReceipt: created.length > 1,
+      receipts: created,
+    }),
+  });
+}
+
 router.get('/upload-status/:receiptId', async (req, res) => {
   try {
     const userId = req.auth?.userId;
@@ -947,9 +1181,117 @@ router.get('/upload-status/:receiptId', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
     const rid = String(req.params.receiptId || '').trim();
-    if (!mongoose.Types.ObjectId.isValid(rid)) {
-      return res.status(400).json({ success: false, error: 'Invalid receipt id.' });
+    if (!rid) {
+      return res.status(400).json({ success: false, error: 'Invalid id.' });
     }
+
+    if (!isReceiptStatusObjectIdParam(rid)) {
+      if (receiptQueue && isBullMqNumericJobIdParam(rid)) {
+        let bullJob;
+        try {
+          bullJob = await receiptQueue.getJob(rid);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : 'Queue lookup failed';
+          return res.status(500).json({ success: false, error: msg });
+        }
+        if (bullJob) {
+          const jobUserId = String(bullJob.data?.userId ?? '').trim();
+          if (jobUserId !== String(userId).trim()) {
+            return res.status(403).json({ success: false, error: 'Forbidden.' });
+          }
+          let state;
+          try {
+            state = await bullJob.getState();
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : 'Job state failed';
+            return res.status(500).json({ success: false, error: msg });
+          }
+          if (state === 'completed') {
+            const ret = bullJob.returnvalue;
+            const ids = Array.isArray(ret?.receiptIds) ? ret.receiptIds : [];
+            const primaryId = ids[0];
+            if (!primaryId) {
+              return res.status(500).json({
+                success: false,
+                error: 'Job completed without receipt data.',
+              });
+            }
+            const primary = await Receipt.findOne({
+              _id: new mongoose.Types.ObjectId(String(primaryId)),
+              user: new mongoose.Types.ObjectId(userId),
+            }).lean();
+            if (!primary) {
+              return res.status(404).json({ success: false, error: 'Receipt not found.' });
+            }
+            return sendResolvedReceiptDraftStatus(res, userId, primary);
+          }
+          if (state === 'failed') {
+            return res.json({
+              success: true,
+              processingStatus: 'failed',
+              receiptId: rid,
+              jobId: rid,
+              error: bullJob.failedReason || 'Processing failed',
+              aiParseFailed: true,
+            });
+          }
+          const processing = state === 'active';
+          return res.json({
+            success: true,
+            processingStatus: processing ? 'processing' : 'pending',
+            receiptId: rid,
+            jobId: rid,
+          });
+        }
+        return res.status(404).json({
+          success: false,
+          error: 'Receipt job not found or expired.',
+        });
+      }
+
+      const job = await ReceiptUploadJob.findOne({
+        jobId: rid,
+        user: new mongoose.Types.ObjectId(userId),
+      }).lean();
+      if (!job) {
+        return res.status(404).json({ success: false, error: 'Upload job not found.' });
+      }
+      if (job.status === 'queued') {
+        return res.json({
+          success: true,
+          processingStatus: 'pending',
+          receiptId: rid,
+        });
+      }
+      if (job.status === 'processing') {
+        return res.json({
+          success: true,
+          processingStatus: 'processing',
+          receiptId: rid,
+        });
+      }
+      if (job.status === 'failed') {
+        return res.json({
+          success: true,
+          processingStatus: 'failed',
+          receiptId: rid,
+          error: job.processingError || 'Processing failed',
+          aiParseFailed: true,
+        });
+      }
+      if (job.status === 'completed' && job.resultReceiptId) {
+        const primary = await Receipt.findOne({
+          _id: job.resultReceiptId,
+          user: new mongoose.Types.ObjectId(userId),
+        }).lean();
+        if (!primary) {
+          return res.status(404).json({ success: false, error: 'Receipt not found.' });
+        }
+        return sendResolvedReceiptDraftStatus(res, userId, primary);
+      }
+      return res.status(500).json({ success: false, error: 'Unknown upload job state.' });
+    }
+
     const primary = await Receipt.findOne({
       _id: new mongoose.Types.ObjectId(rid),
       user: new mongoose.Types.ObjectId(userId),
@@ -958,76 +1300,7 @@ router.get('/upload-status/:receiptId', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Receipt not found.' });
     }
 
-    const status = primary.processingStatus || 'completed';
-    const out = {
-      success: true,
-      processingStatus: status,
-      receiptId: String(primary._id),
-    };
-
-    if (status === 'pending' || status === 'processing') {
-      return res.json(out);
-    }
-
-    if (status === 'failed') {
-      return res.json({
-        ...out,
-        error: primary.processingError || 'Processing failed',
-        aiParseFailed: Boolean(primary.aiParseFailed),
-      });
-    }
-
-    const linked = Array.isArray(primary.linkedReceiptIds) ? primary.linkedReceiptIds : [];
-    const ids = [primary._id, ...linked];
-    const rows = await Receipt.find({
-      _id: { $in: ids },
-      user: new mongoose.Types.ObjectId(userId),
-    })
-      .sort({ createdAt: 1 })
-      .lean();
-
-    const toAiShape = (row) => ({
-      vendor: row.vendor,
-      total: row.total,
-      currency: row.currency,
-      date: row.date,
-      tax: row.tax,
-      items: row.items,
-      confidence: row.confidence,
-    });
-
-    const created = rows.map((row) => {
-      const slip = toAiShape(row);
-      return {
-        receiptId: String(row._id),
-        aiData: slip,
-        rawText: typeof row.rawText === 'string' ? row.rawText : '',
-        reviewHint: typeof row.reviewHint === 'string' ? row.reviewHint : '',
-        needsReview: Boolean(row.needsReview),
-      };
-    });
-
-    const first = created[0];
-    const combinedRaw = capRawText(
-      created.map((c) => c.rawText).filter(Boolean).join('\n\n--- next receipt ---\n\n'),
-    );
-    const needsReviewAny = created.some((c) => c.needsReview);
-
-    return res.json({
-      ...out,
-      ...receiptJson({
-        success: true,
-        rawText: combinedRaw,
-        aiParseFailed: false,
-        aiData: first?.aiData,
-        ocrFailed: false,
-        needsReview: needsReviewAny,
-        receiptId: first?.receiptId,
-        receiptIds: created.map((c) => c.receiptId),
-        multiReceipt: created.length > 1,
-        receipts: created,
-      }),
-    });
+    return sendResolvedReceiptDraftStatus(res, userId, primary);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Status failed';
     return res.status(500).json({ success: false, error: message });
@@ -1037,7 +1310,7 @@ router.get('/upload-status/:receiptId', async (req, res) => {
 router.post(
   '/upload',
   (req, res, next) => {
-    const multerSingle = receiptAsyncPipelineEnabled()
+    const multerSingle = receiptBullAsyncUploadEnabled()
       ? uploadMemory.single('receipt')
       : upload.single('receipt');
     multerSingle(req, res, (err) => {
@@ -1072,7 +1345,7 @@ router.post(
     let tempFile = null;
 
     try {
-      if (receiptAsyncPipelineEnabled()) {
+      if (receiptBullAsyncUploadEnabled()) {
         const buf = req.file.buffer;
         if (!buf || !Buffer.isBuffer(buf)) {
           return res.status(500).json(
@@ -1086,26 +1359,43 @@ router.post(
           );
         }
         const userId = req.auth.userId;
-        const { url, publicId } = await uploadReceiptImageBuffer(buf, {
-          userId,
-          originalFilename: req.file.originalname,
-        });
-        const receiptId = await createPendingReceiptPlaceholder(userId, {
-          imageUrl: url,
-          cloudinaryPublicId: publicId,
-        });
-        await inngest.send({
-          name: 'receipt/uploaded',
-          data: { receiptId, imageUrl: url, userId: String(userId) },
-        });
-        return res.status(202).json({
-          success: true,
-          accepted: true,
-          processingStatus: 'pending',
-          receiptId,
-          pollUrl: `/api/receipt/upload-status/${receiptId}`,
-          message: 'Receipt queued for processing.',
-        });
+        try {
+          const { url, publicId } = await uploadReceiptImageBuffer(buf, {
+            userId,
+            originalFilename: req.file.originalname,
+          });
+          const name = `receipt_task_${Date.now()}_0`;
+          const job = await receiptQueue.add(name, {
+            fileName:
+              typeof req.file.originalname === 'string'
+                ? req.file.originalname
+                : 'receipt',
+            userId,
+            imageUrl: url,
+            cloudinaryPublicId: publicId,
+          });
+          const jobId = String(job.id);
+          console.log('[receipt] BullMQ receipt job queued', { jobId });
+          return res.status(202).json({
+            success: true,
+            accepted: true,
+            processingStatus: 'pending',
+            jobId,
+            receiptId: jobId,
+            pollUrl: `/api/receipt/upload-status/${encodeURIComponent(jobId)}`,
+            message: 'Receipt queued for processing.',
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[receipt] async queue upload failed (cloudinary or queue):', msg);
+          return res.status(503).json({
+            success: false,
+            error:
+              'Could not queue receipt. Verify Cloudinary env vars, REDIS_URL, RECEIPT_USE_BULLMQ=1, and that a worker is running.',
+            code: 'ASYNC_QUEUE_FAILED',
+            ...(process.env.NODE_ENV !== 'production' ? { detail: msg } : {}),
+          });
+        }
       }
 
       if (!filePath) {
