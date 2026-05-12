@@ -5,7 +5,7 @@
   "functions": {
     "api/index.js": {
       "maxDuration": 300,
-      "includeFiles": "{src/**,node_modules/{multer,busboy,append-field,concat-stream,type-is,@google/generative-ai,inngest,cloudinary,bullmq,ioredis}/**}"
+      "includeFiles": "{src/**,node_modules/{multer,busboy,streamsearch,append-field,concat-stream,type-is,@google/generative-ai,inngest,cloudinary,bullmq,ioredis}/**}"
     }
   }
 }
