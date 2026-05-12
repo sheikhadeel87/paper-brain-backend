@@ -1,4 +1,16 @@
-import IORedis from 'ioredis'
+import { createRequire } from 'node:module'
+
+const require = createRequire(import.meta.url)
+
+/** Lazy-load so Vercel serverless (queue off) never resolves `ioredis` at cold start. */
+let IORedisCtor = null
+function getIORedis() {
+  if (!IORedisCtor) {
+    const mod = require('ioredis')
+    IORedisCtor = mod?.default ?? mod
+  }
+  return IORedisCtor
+}
 
 let warnedMissingRedisUrl = false
 
@@ -140,6 +152,7 @@ function attachRedisLifecycleLog(redis, role) {
  * @param {'queue' | 'worker'} [role] — labels `connect` / `error` logs for Upstash debugging
  */
 export function createBullmqRedisConnection(role = 'bullmq') {
+  const IORedis = getIORedis()
   const urlCfg = buildUrlConnectionOptions()
   let redis
 
