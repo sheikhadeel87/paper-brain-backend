@@ -1,4 +1,5 @@
 import { connectMongo } from '../../lib/mongoConnect.js';
+import { receiptQueueMinSlotMs } from '../../lib/receiptQueueSlotMs.js';
 import { inngest } from '../client.js';
 
 export const processReceiptWorkflow = inngest.createFunction(
@@ -41,6 +42,11 @@ export const processReceiptWorkflow = inngest.createFunction(
       const { finalizePendingReceiptsFromGemini } = await import('../../routes/receipt.js');
       return finalizePendingReceiptsFromGemini(String(receiptId), String(userId), gemini);
     });
+
+    const slotMs = receiptQueueMinSlotMs();
+    if (slotMs > 0) {
+      await step.sleep('inter-receipt-min-slot', slotMs);
+    }
 
     return { ok: true, receiptId: String(receiptId) };
   },
