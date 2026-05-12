@@ -1,6 +1,7 @@
 /**
- * Minimum wall time between finishing one receipt job and starting the next (queue worker,
- * inline `/upload-multiple`, and Inngest `receipt/uploaded` runs per user).
+ * Minimum wall time between **Mongo receipt persists** for the same user (per-user Redis
+ * throttle in `receiptUserPersistThrottle.js`, applied **before** each job’s Gemini + draft
+ * insert). Queue worker, inline `/upload-multiple`, etc.
  * Set `RECEIPT_QUEUE_MIN_SLOT_MS=0` to disable spacing (e.g. local dev).
  */
 export function receiptQueueMinSlotMs() {
