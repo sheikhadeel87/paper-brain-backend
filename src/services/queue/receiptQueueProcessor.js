@@ -1,4 +1,5 @@
 import fsp from 'node:fs/promises'
+import { receiptQueueMinSlotMs } from '../../lib/receiptQueueSlotMs.js'
 import {
   capRawText,
   computeReceiptDraftReview,
@@ -11,20 +12,7 @@ import {
 import { Expense } from '../../models/Expense.js'
 import { Receipt } from '../../models/Receipt.js'
 
-/** Same env as worker: optional delay after each job (queue mode only; inline skips). */
-export function receiptQueueMinSlotMs() {
-  return Math.max(
-    0,
-    parseInt(
-      String(
-        process.env.RECEIPT_QUEUE_MIN_SLOT_MS ??
-          process.env.RECEIPT_QUEUE_INTER_JOB_DELAY_MS ??
-          '60000',
-      ),
-      10,
-    ) || 0,
-  )
-}
+export { receiptQueueMinSlotMs } from '../../lib/receiptQueueSlotMs.js'
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -35,7 +23,7 @@ function sleep(ms) {
 /**
  * OCR + Gemini + draft rows — shared by BullMQ worker and inline `/upload-multiple` fallback.
  * @param {{ filePath: string, fileName: string, userId: string }} jobData
- * @param {{ applyMinSlot?: boolean }} [options] — set `false` for HTTP inline processing.
+ * @param {{ applyMinSlot?: boolean }} [options] — default `true` (respects `RECEIPT_QUEUE_MIN_SLOT_MS`).
  */
 export async function processReceiptQueueJobData(jobData, options = {}) {
   const applyMinSlot = options.applyMinSlot !== false

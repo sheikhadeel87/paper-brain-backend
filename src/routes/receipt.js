@@ -148,7 +148,7 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
             fileName: name,
             userId,
           },
-          { applyMinSlot: false },
+          { applyMinSlot: i < files.length - 1 },
         );
         completed += 1;
         results.push({
