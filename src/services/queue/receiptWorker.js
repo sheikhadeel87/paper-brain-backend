@@ -1,6 +1,9 @@
 import { DelayedError, Worker } from 'bullmq'
 import { logGeminiKeyPool } from '../../lib/geminiApiKeyPool.js'
-import { createBullmqRedisConnection } from './redisConnection.js'
+import {
+  attachRedisLifecycleLog,
+  createBullmqRedisConnection,
+} from './redisConnection.js'
 import { receiptQueueEnabled } from './receiptQueue.js'
 import { getReceiptWorkerConcurrency } from './receiptWorkerConcurrency.js'
 
@@ -27,6 +30,7 @@ export const receiptWorker = receiptQueueEnabled
   ? (() => {
       connection = createBullmqRedisConnection('worker')
       lockRedis = connection.duplicate()
+      attachRedisLifecycleLog(lockRedis, 'worker-lock')
       return new Worker(
         'receipt-processing',
         async (job, token) => {

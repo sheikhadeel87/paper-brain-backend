@@ -26,6 +26,11 @@ let warnedMissingRedisUrl = false
  * @see https://docs.bullmq.io/guide/connections
  */
 
+function redisFamilyOption() {
+  const v = String(process.env.REDIS_FORCE_IPV4 || '').trim().toLowerCase()
+  return ['1', 'true', 'yes'].includes(v) ? { family: 4 } : {}
+}
+
 function buildUrlConnectionOptions() {
   const url = String(process.env.REDIS_URL || '').trim()
   if (!url) return null
@@ -36,6 +41,7 @@ function buildUrlConnectionOptions() {
       maxRetriesPerRequest: null,
       connectTimeout: 10_000,
       enableReadyCheck: false,
+      ...redisFamilyOption(),
       ...(isTlsUrl ? { tls: { rejectUnauthorized: false } } : {}),
     },
   }
@@ -85,6 +91,7 @@ function buildDiscreteRemoteOptions() {
       maxRetriesPerRequest: null,
       connectTimeout: 10_000,
       enableReadyCheck: false,
+      ...redisFamilyOption(),
       ...(useTls ? { tls: { rejectUnauthorized: false } } : {}),
     },
   }
@@ -131,7 +138,7 @@ function logRedisEndpointDiscrete(role, opts) {
   )
 }
 
-function attachRedisLifecycleLog(redis, role) {
+export function attachRedisLifecycleLog(redis, role) {
   const tag = `[redis:${role}]`
   redis.on('error', (err) => {
     console.error(`${tag} connection error:`, err?.message || err)
@@ -140,6 +147,18 @@ function attachRedisLifecycleLog(redis, role) {
       console.error(
         `${tag} WRONGPASS: bad credentials. Fix REDIS_URL (re-copy from Upstash Redis, not REST), or unset REDIS_URL and use UPSTASH_REDIS_HOST + UPSTASH_REDIS_PASSWORD. If the password has @ : # encode it in the URL or use the discrete env vars.`,
       )
+    }
+    if (msg.includes('ETIMEDOUT') || msg.includes('ECONNREFUSED')) {
+      const hostHint =
+        typeof redis?.options?.host === 'string' ? redis.options.host : ''
+      const isUpstash =
+        hostHint.includes('upstash.io') ||
+        String(process.env.REDIS_URL || '').includes('upstash.io')
+      if (isUpstash) {
+        console.error(
+          `${tag} Cannot reach Redis (TCP). Check: (1) REDIS_URL uses rediss:// (TLS), not redis:// — copy from Upstash “Redis” tab, not REST. (2) Outbound port 6379 allowed (try another network / hotspot if corporate VPN blocks it). (3) Optional: set REDIS_FORCE_IPV4=1 if IPv6 routing is broken.`,
+        )
+      }
     }
   })
   redis.on('connect', () => {
