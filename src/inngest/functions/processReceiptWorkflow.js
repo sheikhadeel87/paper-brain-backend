@@ -31,9 +31,14 @@ export const processReceiptWorkflow = inngest.createFunction(
     },
   },
   async ({ event, step }) => {
-    const { jobId, imageUrl, userId, cloudinaryPublicId } = event.data;
+    const { jobId, imageUrl, userId, cloudinaryPublicId } = event.data || {};
     if (!jobId || !imageUrl || !userId) {
-      throw new Error('receipt/uploaded missing jobId, imageUrl, or userId');
+      console.warn('[inngest:receipt] receipt/uploaded ignored — incomplete payload', {
+        hasJobId: Boolean(jobId),
+        hasImageUrl: Boolean(imageUrl),
+        hasUserId: Boolean(userId),
+      });
+      return { skipped: true, reason: 'incomplete_payload' };
     }
     const pub = typeof cloudinaryPublicId === 'string' ? cloudinaryPublicId : '';
 
