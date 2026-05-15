@@ -5,6 +5,7 @@ import mongoose from 'mongoose';
 import { User } from '../models/User.js';
 import { requireAuth } from '../middleware/requireAuth.js';
 import { JWT_SECRET } from '../lib/jwtSecret.js';
+import { repairUserSubscriptionPeriodEnd } from './stripe.js';
 
 const router = express.Router();
 
@@ -22,7 +23,15 @@ function signToken(user) {
 
 function userJson(doc) {
   const id = doc._id != null ? String(doc._id) : String(doc.id);
-  return { id, email: doc.email, name: doc.name };
+  return {
+    id,
+    email: doc.email,
+    name: doc.name,
+    plan: doc.plan || 'free',
+    subscriptionStatus: doc.subscriptionStatus || 'free',
+    subscriptionCurrentPeriodEnd: doc.subscriptionCurrentPeriodEnd || null,
+    subscriptionCancelAtPeriodEnd: Boolean(doc.subscriptionCancelAtPeriodEnd),
+  };
 }
 
 router.post('/register', async (req, res) => {
@@ -91,9 +100,25 @@ router.get('/me', requireAuth, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.auth.userId)) {
       return res.status(401).json({ success: false, error: 'Invalid user.' });
     }
-    const user = await User.findById(req.auth.userId).select('name email').lean();
+    let user = await User.findById(req.auth.userId)
+      .select(
+        'name email plan stripeSubscriptionId subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
+      )
+      .lean();
     if (!user) {
       return res.status(401).json({ success: false, error: 'User not found.' });
+    }
+    if (
+      user.plan === 'pro' &&
+      user.stripeSubscriptionId &&
+      !user.subscriptionCurrentPeriodEnd
+    ) {
+      await repairUserSubscriptionPeriodEnd(req.auth.userId);
+      user = await User.findById(req.auth.userId)
+        .select(
+          'name email plan subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
+        )
+        .lean();
     }
     return res.json({ success: true, user: userJson(user) });
   } catch {

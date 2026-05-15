@@ -11,6 +11,13 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
     password: { type: String, required: true, select: false },
+    plan: { type: String, enum: ['free', 'pro'], default: 'free' },
+    stripeCustomerId: { type: String, default: '', index: true },
+    stripeSubscriptionId: { type: String, default: '', index: true },
+    subscriptionStatus: { type: String, default: 'free' },
+    subscriptionCurrentPeriodEnd: { type: Date, default: null },
+    /** True when the user cancelled but Stripe keeps access until `subscriptionCurrentPeriodEnd`. */
+    subscriptionCancelAtPeriodEnd: { type: Boolean, default: false },
   },
   { timestamps: true },
 );

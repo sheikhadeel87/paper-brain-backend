@@ -4,6 +4,7 @@ import cors from 'cors'
 import { connectMongo } from './lib/mongoConnect.js'
 import authRoutes from './routes/auth.js'
 import expenseRoutes from './routes/expenses.js'
+import stripeRoutes from './routes/stripe.js'
 import { serve } from 'inngest/express'
 import { inngest } from './inngest/client.js'
 import { processReceiptWorkflow } from './inngest/functions/processReceiptWorkflow.js'
@@ -79,6 +80,7 @@ app.use((req, res, next) => {
 })
 
 app.use(cors(corsOptions))
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }))
 app.use(express.json())
 
 app.get('/health', (req, res) => {
@@ -107,6 +109,7 @@ app.use('/api', async (req, res, next) => {
 })
 
 app.use('/api/auth', authRoutes)
+app.use('/api/stripe', stripeRoutes)
 app.use(
   '/api/inngest',
   serve({ client: inngest, functions: [processReceiptWorkflow] }),
