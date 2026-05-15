@@ -17,6 +17,12 @@ import {
 } from '../lib/geminiApiKeyPool.js';
 import { Receipt } from '../models/Receipt.js';
 import { ReceiptUploadJob } from '../models/ReceiptUploadJob.js';
+import { User } from '../models/User.js';
+import {
+  freeTierLimitJson,
+  getReceiptUploadUsage,
+  reserveReceiptUploadSlots,
+} from '../lib/receiptUploadLimit.js';
 import { processTimingMiddleware } from '../middleware/processTiming.js';
 import { requireAuth } from '../middleware/requireAuth.js';
 import { receiptQueue } from '../services/queue/receiptQueue.js';
@@ -87,6 +93,36 @@ const uploadMemory = multer({
 
 const MULTI_UPLOAD_MAX_FILES = 10;
 
+async function userPlanForUploadLimit(userId) {
+  const user = await User.findById(userId).select('plan').lean();
+  return user?.plan || 'free';
+}
+
+/** Returns false when the response was already sent (Free tier daily cap). */
+async function enforceReceiptUploadLimit(res, userId, plan, slots) {
+  const reservation = await reserveReceiptUploadSlots(userId, plan, slots);
+  if (!reservation.ok) {
+    res.status(403).json(freeTierLimitJson(reservation));
+    return false;
+  }
+  return true;
+}
+
+router.get('/upload-quota', async (req, res) => {
+  try {
+    const userId = req.auth?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+    const plan = await userPlanForUploadLimit(userId);
+    const usage = await getReceiptUploadUsage(userId, plan);
+    return res.json({ success: true, ...usage });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Could not load upload quota.';
+    return res.status(500).json({ success: false, error: message });
+  }
+});
+
 router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES), async (req, res) => {
   try {
     const files = Array.isArray(req.files) ? req.files : [];
@@ -100,6 +136,15 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
     const userId = req.auth?.userId;
     if (!userId) {
       return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    const plan = await userPlanForUploadLimit(userId);
+    const allowed = await enforceReceiptUploadLimit(res, userId, plan, files.length);
+    if (!allowed) {
+      for (const file of files) {
+        if (file?.path) await fsp.unlink(file.path).catch(() => {});
+      }
+      return;
     }
 
     const fileNames = files.map((f) =>
@@ -1345,6 +1390,14 @@ router.post(
     let tempFile = null;
 
     try {
+      const userId = req.auth?.userId;
+      const plan = await userPlanForUploadLimit(userId);
+      const allowed = await enforceReceiptUploadLimit(res, userId, plan, 1);
+      if (!allowed) {
+        if (filePath) await fsp.unlink(filePath).catch(() => {});
+        return;
+      }
+
       if (receiptBullAsyncUploadEnabled()) {
         const buf = req.file.buffer;
         if (!buf || !Buffer.isBuffer(buf)) {
@@ -1358,7 +1411,6 @@ router.post(
             }),
           );
         }
-        const userId = req.auth.userId;
         try {
           const { url, publicId } = await uploadReceiptImageBuffer(buf, {
             userId,
