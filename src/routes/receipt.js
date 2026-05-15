@@ -2,6 +2,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import mongoose from 'mongoose';
 import multer from 'multer';
@@ -28,6 +29,7 @@ import { requireAuth } from '../middleware/requireAuth.js';
 import { receiptQueue } from '../services/queue/receiptQueue.js';
 import { enqueueReceiptUploadJobs } from '../services/queue/receiptFlowEnqueue.js';
 import { getReceiptWorkerConcurrency } from '../services/queue/receiptWorkerConcurrency.js';
+import { inngest } from '../inngest/client.js';
 
 const router = express.Router();
 router.use(processTimingMiddleware);
@@ -45,6 +47,15 @@ function receiptAsyncPipelineEnabled() {
 /** Single-file 202 async path: Cloudinary + Redis Bull queue only (Receipt created in worker). */
 function receiptBullAsyncUploadEnabled() {
   return isCloudinaryConfigured() && Boolean(receiptQueue);
+}
+
+/** Vercel-friendly async path: Cloudinary + Inngest when BullMQ is not available. */
+function receiptInngestAsyncUploadEnabled() {
+  return (
+    isCloudinaryConfigured() &&
+    Boolean(String(process.env.INNGEST_EVENT_KEY || '').trim()) &&
+    !receiptQueue
+  );
 }
 
 /** Tesseract in Node loads WASM; on serverless that often adds 15–30s+ per cold request. Set RECEIPT_TESSERACT=1 to enable (e.g. local). Vision-only (Gemini image) is the default. */
@@ -428,11 +439,14 @@ router.get('/processing-config', async (req, res) => {
       cloudinaryConfigured: cloud,
       inngestEventKeyConfigured: inngestKey,
       receiptWorkerConcurrency: getReceiptWorkerConcurrency(),
+      receiptInngestAsyncUploadEnabled: receiptInngestAsyncUploadEnabled(),
       hint: receiptBullAsyncUploadEnabled()
         ? 'Single-file async upload uses BullMQ: set REDIS_URL and RECEIPT_USE_BULLMQ=1; run a worker (not Vercel serverless) so jobs complete.'
-        : asyncOn
-          ? 'For async (202) single uploads without BullMQ, configure Redis + RECEIPT_USE_BULLMQ=1, or use INNGEST_EVENT_KEY for other flows.'
-          : 'Set CLOUDINARY_URL (or CLOUDINARY_CLOUD_NAME + API_KEY + API_SECRET). For queued single uploads add Redis + RECEIPT_USE_BULLMQ=1.',
+        : receiptInngestAsyncUploadEnabled()
+          ? 'Single-file async upload uses Inngest: CLOUDINARY_URL + INNGEST_EVENT_KEY (no Redis). Events go to receipt/uploaded → processReceiptWorkflow.'
+          : asyncOn
+            ? 'For async (202) single uploads without BullMQ, set INNGEST_EVENT_KEY + Cloudinary, or add Redis + RECEIPT_USE_BULLMQ=1.'
+            : 'Set CLOUDINARY_URL (or CLOUDINARY_CLOUD_NAME + API_KEY + API_SECRET). For queued single uploads add Redis + RECEIPT_USE_BULLMQ=1, or Inngest + INNGEST_EVENT_KEY on serverless.',
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Config failed';
@@ -1355,9 +1369,10 @@ router.get('/upload-status/:receiptId', async (req, res) => {
 router.post(
   '/upload',
   (req, res, next) => {
-    const multerSingle = receiptBullAsyncUploadEnabled()
-      ? uploadMemory.single('receipt')
-      : upload.single('receipt');
+    const multerSingle =
+      receiptBullAsyncUploadEnabled() || receiptInngestAsyncUploadEnabled()
+        ? uploadMemory.single('receipt')
+        : upload.single('receipt');
     multerSingle(req, res, (err) => {
       if (err) {
         const msg = err instanceof Error ? err.message : 'Upload failed';
@@ -1445,6 +1460,68 @@ router.post(
             error:
               'Could not queue receipt. Verify Cloudinary env vars, REDIS_URL, RECEIPT_USE_BULLMQ=1, and that a worker is running.',
             code: 'ASYNC_QUEUE_FAILED',
+            ...(process.env.NODE_ENV !== 'production' ? { detail: msg } : {}),
+          });
+        }
+      }
+
+      if (receiptInngestAsyncUploadEnabled()) {
+        const buf = req.file.buffer;
+        if (!buf || !Buffer.isBuffer(buf)) {
+          return res.status(500).json(
+            receiptJson({
+              success: false,
+              error: 'Internal upload error (buffer missing).',
+              code: 'INTERNAL_ERROR',
+              rawText: '',
+              aiParseFailed: true,
+            }),
+          );
+        }
+        const jobId = randomUUID();
+        try {
+          const { url, publicId } = await uploadReceiptImageBuffer(buf, {
+            userId,
+            originalFilename: req.file.originalname,
+          });
+          await ReceiptUploadJob.create({
+            jobId,
+            user: new mongoose.Types.ObjectId(userId),
+            imageUrl: url,
+            cloudinaryPublicId: typeof publicId === 'string' ? publicId : '',
+            status: 'queued',
+          });
+          await inngest.send({
+            name: 'receipt/uploaded',
+            data: {
+              jobId,
+              imageUrl: url,
+              userId: String(userId),
+              cloudinaryPublicId: typeof publicId === 'string' ? publicId : '',
+            },
+          });
+          console.log('[receipt] Inngest receipt job queued', { jobId });
+          return res.status(202).json({
+            success: true,
+            accepted: true,
+            processingStatus: 'pending',
+            jobId,
+            receiptId: jobId,
+            pollUrl: `/api/receipt/upload-status/${encodeURIComponent(jobId)}`,
+            message: 'Receipt queued for processing.',
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[receipt] Inngest async upload failed:', msg);
+          await ReceiptUploadJob.deleteOne({
+            jobId,
+            user: new mongoose.Types.ObjectId(userId),
+          }).catch(() => {});
+          return res.status(503).json({
+            success: false,
+            error:
+              'Could not queue receipt for processing. Verify CLOUDINARY_URL and INNGEST_EVENT_KEY, and that Inngest can reach your /api/inngest endpoint.',
+            code: 'INNGEST_QUEUE_FAILED',
             ...(process.env.NODE_ENV !== 'production' ? { detail: msg } : {}),
           });
         }
