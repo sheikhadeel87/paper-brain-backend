@@ -28,6 +28,7 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.4.1",
     "multer": "^2.1.1",
+    "nodemailer": "^8.0.7",
     "stripe": "^22.1.1",
     "tesseract.js": "^7.0.0",
     "tslib": "^2.8.1"

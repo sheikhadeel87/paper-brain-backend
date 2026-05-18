@@ -11,6 +11,8 @@ const userSchema = new mongoose.Schema(
       trim: true,
     },
     password: { type: String, required: true, select: false },
+    isVerified: { type: Boolean, default: false, index: true },
+    verificationToken: { type: String, default: null, select: false },
     plan: { type: String, enum: ['free', 'pro'], default: 'free' },
     stripeCustomerId: { type: String, default: '', index: true },
     stripeSubscriptionId: { type: String, default: '', index: true },

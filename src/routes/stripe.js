@@ -2,6 +2,7 @@ import express from 'express';
 import Stripe from 'stripe';
 import mongoose from 'mongoose';
 import { requireAuth } from '../middleware/requireAuth.js';
+import { requireEmailVerified } from '../middleware/requireEmailVerified.js';
 import { User } from '../models/User.js';
 
 const router = express.Router();
@@ -190,13 +191,20 @@ export async function repairUserSubscriptionPeriodEnd(userId) {
   }
 }
 
-router.post('/checkout', requireAuth, async (req, res, next) => {
+router.post('/checkout', requireAuth, requireEmailVerified, async (req, res, next) => {
   try {
     if (!requireStripeConfig(res, { needsPrice: true })) return;
 
-    const user = await User.findById(req.auth.userId);
+    const user = await User.findById(req.auth.userId).select('isVerified email name stripeCustomerId');
     if (!user) {
       return res.status(404).json({ success: false, error: 'User not found.' });
+    }
+    if (user.isVerified === false) {
+      return res.status(403).json({
+        success: false,
+        error: 'Please verify your email first.',
+        code: 'EMAIL_NOT_VERIFIED',
+      });
     }
 
     const customerId = await ensureStripeCustomer(user);
