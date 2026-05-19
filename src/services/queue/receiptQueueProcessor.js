@@ -16,6 +16,11 @@ import {
   markUserReceiptPersistTime,
   waitForUserReceiptPersistSlot,
 } from './receiptUserPersistThrottle.js'
+import {
+  DEFAULT_RECEIPT_CATEGORY,
+  normalizeReceiptCategory,
+} from '../../lib/receiptCategories.js'
+import { categorizeReceipt } from '../receiptCategorization.js'
 
 export { receiptQueueMinSlotMs } from '../../lib/receiptQueueSlotMs.js'
 
@@ -102,6 +107,17 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
           : ''
       const slipForDb = { ...aiData }
       delete slipForDb.receiptText
+      const existingCategory = normalizeReceiptCategory(slipForDb.category)
+      const category =
+        existingCategory !== DEFAULT_RECEIPT_CATEGORY || slipForDb.category === DEFAULT_RECEIPT_CATEGORY
+          ? existingCategory
+          : await categorizeReceipt({
+              merchant: slipForDb.vendor,
+              items: slipForDb.items,
+              total: slipForDb.total,
+            })
+      slipForDb.category = normalizeReceiptCategory(category)
+      slipForDb.categorySource = 'AI'
 
       const slipRaw = capRawText(
         visionTranscript || rawText || `OCR Text for ${fileName}`,

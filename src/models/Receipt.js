@@ -1,4 +1,9 @@
 import mongoose from 'mongoose';
+import {
+  DEFAULT_RECEIPT_CATEGORY,
+  RECEIPT_CATEGORIES,
+  RECEIPT_CATEGORY_SOURCES,
+} from '../lib/receiptCategories.js';
 
 const receiptItemSchema = new mongoose.Schema(
   {
@@ -31,6 +36,17 @@ const receiptSchema = new mongoose.Schema(
     tax: { type: Number, default: null },
     items: { type: [receiptItemSchema], default: [] },
     rawText: { type: String, default: '' },
+    category: {
+      type: String,
+      enum: RECEIPT_CATEGORIES,
+      default: DEFAULT_RECEIPT_CATEGORY,
+    },
+    categorySource: {
+      type: String,
+      enum: RECEIPT_CATEGORY_SOURCES,
+      default: 'AI',
+    },
+    categoryConfidence: { type: Number, default: null },
     confidence: { type: Number, default: 0 },
     /** Shown in the app when totals do not reconcile or the worker flagged the draft. */
     reviewHint: { type: String, default: '' },

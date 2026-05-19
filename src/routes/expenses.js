@@ -4,8 +4,13 @@ import { Expense } from '../models/Expense.js';
 import { Receipt } from '../models/Receipt.js';
 import {
   applyReceiptValidation,
+  hasReceiptLineAmount,
   validateTotals,
 } from '../lib/receiptValidation.js';
+import {
+  isReceiptCategory,
+  normalizeReceiptCategory,
+} from '../lib/receiptCategories.js';
 import { processTimingMiddleware } from '../middleware/processTiming.js';
 import { requireAuth } from '../middleware/requireAuth.js';
 
@@ -33,7 +38,7 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Query: `from`, `to` (YYYY-MM-DD on `createdAt`), `vendor` (substring on `finalData.vendor`), `confidenceFlag` (`auto` | `review`). */
+/** Query: `from`, `to` (YYYY-MM-DD on `createdAt`), `vendor`, `confidenceFlag`, `category`. */
 function buildExpenseFilter(query) {
   const filter = {};
   const from = typeof query.from === 'string' ? query.from.trim() : '';
@@ -57,6 +62,10 @@ function buildExpenseFilter(query) {
   if (cf === 'auto' || cf === 'review') {
     filter.confidenceFlag = cf;
   }
+  const category = typeof query.category === 'string' ? query.category.trim() : '';
+  if (isReceiptCategory(category)) {
+    filter['finalData.category'] = category;
+  }
   return filter;
 }
 
@@ -68,21 +77,35 @@ function parseLimitSkip(query) {
   return { limit, skip };
 }
 
-async function spendingSummaryByCurrency(filter) {
-  const rows = await Expense.aggregate([
-    { $match: filter },
-    {
-      $group: {
-        _id: '$finalData.currency',
-        total: { $sum: { $ifNull: ['$finalData.total', 0] } },
-        count: { $sum: 1 },
+async function spendingSummary(filter) {
+  const [currencyRows, categoryRows] = await Promise.all([
+    Expense.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: '$finalData.currency',
+          total: { $sum: { $ifNull: ['$finalData.total', 0] } },
+          count: { $sum: 1 },
+        },
       },
-    },
-    { $sort: { _id: 1 } },
+      { $sort: { _id: 1 } },
+    ]),
+    Expense.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: '$finalData.category',
+          total: { $sum: { $ifNull: ['$finalData.total', 0] } },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { total: -1 } },
+    ]),
   ]);
   const byCurrency = {};
+  const byCategory = {};
   let expenseCount = 0;
-  for (const r of rows) {
+  for (const r of currencyRows) {
     const key =
       r._id !== undefined && r._id !== null && String(r._id).trim() !== ''
         ? String(r._id)
@@ -90,7 +113,14 @@ async function spendingSummaryByCurrency(filter) {
     byCurrency[key] = { total: r.total, count: r.count };
     expenseCount += r.count;
   }
-  return { expenseCount, byCurrency };
+  for (const r of categoryRows) {
+    const key = normalizeReceiptCategory(r._id);
+    byCategory[key] = {
+      total: (byCategory[key]?.total || 0) + r.total,
+      count: (byCategory[key]?.count || 0) + r.count,
+    };
+  }
+  return { expenseCount, byCurrency, byCategory };
 }
 
 function csvEscape(value) {
@@ -109,6 +139,7 @@ function expensesToCsv(rows) {
     'date',
     'total',
     'currency',
+    'category',
     'tax',
     'confidence',
     'confidenceFlag',
@@ -134,6 +165,7 @@ function expensesToCsv(rows) {
         csvEscape(fd.date),
         csvEscape(fd.total),
         csvEscape(fd.currency),
+        csvEscape(fd.category),
         csvEscape(fd.tax),
         csvEscape(ex.confidence ?? fd.confidence),
         csvEscape(ex.confidenceFlag ?? fd.confidence_flag),
@@ -173,7 +205,7 @@ router.get('/', async (req, res) => {
         .limit(limit)
         .lean(),
       Expense.countDocuments(filter),
-      spendingSummaryByCurrency(filter),
+      spendingSummary(filter),
     ]);
     return res.json({
       success: true,
@@ -253,13 +285,13 @@ function prepareExpenseBody(body) {
   }
 
   applyReceiptValidation(normalized);
+  normalized.category = normalizeReceiptCategory(normalized.category);
+  normalized.categorySource =
+    normalized.categorySource === 'MANUAL' || normalized.categorySource === 'RULE'
+      ? normalized.categorySource
+      : 'AI';
 
-  const priced = normalized.items?.some(
-    (item) =>
-      item &&
-      typeof item.price === 'number' &&
-      !Number.isNaN(item.price),
-  );
+  const priced = normalized.items?.some(hasReceiptLineAmount);
   const totalsCheck = validateTotals(
     normalized.items || [],
     normalized.total,
@@ -345,19 +377,24 @@ router.post('/', async (req, res) => {
   const v = prep.value;
 
   try {
+    let pendingReceipt = null;
     if (v.receiptObjectId) {
-      const pending = await Receipt.findOne({
+      pendingReceipt = await Receipt.findOne({
         _id: v.receiptObjectId,
         user: req.auth.userId,
         expense: null,
       })
-        .select('_id')
+        .select('_id category categorySource')
         .lean();
-      if (!pending) {
+      if (!pendingReceipt) {
         return res.status(400).json({
           success: false,
           error: 'Receipt draft not found or already linked.',
         });
+      }
+      if (!req.body?.finalData?.category && pendingReceipt.category) {
+        v.normalized.category = normalizeReceiptCategory(pendingReceipt.category);
+        v.normalized.categorySource = pendingReceipt.categorySource || 'AI';
       }
     }
 

@@ -7,8 +7,18 @@ import express from 'express';
 import mongoose from 'mongoose';
 import multer from 'multer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { applyReceiptValidation, validateTotals } from '../lib/receiptValidation.js';
+import {
+  applyReceiptValidation,
+  hasReceiptLineAmount,
+  validateTotals,
+} from '../lib/receiptValidation.js';
+import {
+  DEFAULT_RECEIPT_CATEGORY,
+  isReceiptCategory,
+  normalizeReceiptCategory,
+} from '../lib/receiptCategories.js';
 import { uploadReceiptImageBuffer, isCloudinaryConfigured } from '../services/cloudinaryUpload.js';
+import { categorizeReceipt } from '../services/receiptCategorization.js';
 import {
   advanceGeminiKeyIndexAfterQuota,
   advanceGeminiKeyIndexAfterSuccess,
@@ -17,6 +27,7 @@ import {
   peekGeminiKeyIndex,
 } from '../lib/geminiApiKeyPool.js';
 import { Receipt } from '../models/Receipt.js';
+import { Expense } from '../models/Expense.js';
 import { ReceiptUploadJob } from '../models/ReceiptUploadJob.js';
 import { User } from '../models/User.js';
 import {
@@ -273,12 +284,7 @@ export function computeReceiptDraftReview(slip) {
   }
   const priced =
     Array.isArray(slip.items) &&
-    slip.items.some(
-      (item) =>
-        item &&
-        typeof item.price === 'number' &&
-        !Number.isNaN(item.price),
-    );
+    slip.items.some(hasReceiptLineAmount);
   const totalsCheck = validateTotals(slip.items || [], slip.total, slip.tax);
   const totalsInvalid = priced && !totalsCheck.isValid;
   const reviewHint = totalsInvalid
@@ -484,6 +490,52 @@ router.get('/drafts', async (req, res) => {
   }
 });
 
+router.patch('/:id/category', async (req, res) => {
+  try {
+    const userId = req.auth?.userId;
+    const id = String(req.params.id || '').trim();
+    const rawCategory =
+      typeof req.body?.category === 'string' ? req.body.category.trim() : '';
+    const category = normalizeReceiptCategory(rawCategory);
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid receipt id.' });
+    }
+    if (!isReceiptCategory(rawCategory)) {
+      return res.status(400).json({ success: false, error: 'Invalid category.' });
+    }
+
+    const receipt = await Receipt.findOneAndUpdate(
+      { _id: id, user: new mongoose.Types.ObjectId(userId) },
+      { $set: { category, categorySource: 'MANUAL' } },
+      { returnDocument: 'after', runValidators: true },
+    ).lean();
+
+    if (!receipt) {
+      return res.status(404).json({ success: false, error: 'Receipt not found.' });
+    }
+
+    if (receipt.expense) {
+      await Expense.updateOne(
+        { _id: receipt.expense, user: new mongoose.Types.ObjectId(userId) },
+        {
+          $set: {
+            'finalData.category': category,
+            'finalData.categorySource': 'MANUAL',
+          },
+        },
+      );
+    }
+
+    return res.json({ success: true, receipt });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Category update failed';
+    return res.status(500).json({ success: false, error: message });
+  }
+});
+
 /** AI Studio keys use the free quota (no billing) until you enable paid billing in Google Cloud. */
 const geminiModelId = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
 
@@ -581,6 +633,23 @@ function mapAiToReceiptFields(aiData) {
   };
 }
 
+async function addAiCategory(fields, aiData) {
+  const existing = normalizeReceiptCategory(aiData?.category);
+  const category =
+    existing !== DEFAULT_RECEIPT_CATEGORY || isReceiptCategory(aiData?.category)
+      ? existing
+      : await categorizeReceipt({
+          merchant: fields.vendor,
+          items: fields.items,
+          total: fields.total,
+        });
+  return {
+    ...fields,
+    category: normalizeReceiptCategory(category),
+    categorySource: 'AI',
+  };
+}
+
 export async function createReceiptDraft(
   userId,
   { rawText, aiData, aiParseFailed, needsReview, reviewHint = '', processingStatus } = {},
@@ -595,7 +664,7 @@ export async function createReceiptDraft(
     reviewHint: hint,
     expense: null,
   };
-  const fields =
+  let fields =
     aiData && typeof aiData === 'object' && !aiParseFailed
       ? mapAiToReceiptFields(aiData)
       : {
@@ -606,7 +675,12 @@ export async function createReceiptDraft(
           tax: null,
           items: [],
           confidence: 0,
+          category: DEFAULT_RECEIPT_CATEGORY,
+          categorySource: 'AI',
         };
+  if (aiData && typeof aiData === 'object' && !aiParseFailed) {
+    fields = await addAiCategory(fields, aiData);
+  }
   const statusExtra =
     processingStatus && ['pending', 'processing', 'completed', 'failed'].includes(processingStatus)
       ? { processingStatus }
@@ -1001,7 +1075,7 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
     const { needsReview, reviewHint } = computeReceiptDraftReview(slip);
     const hint =
       typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
-    const fields = mapAiToReceiptFields(slip);
+    const fields = await addAiCategory(mapAiToReceiptFields(slip), slip);
 
     if (i === 0) {
       await Receipt.updateOne(
@@ -1196,6 +1270,9 @@ async function sendResolvedReceiptDraftStatus(res, userId, primary) {
     date: row.date,
     tax: row.tax,
     items: row.items,
+    category: row.category || DEFAULT_RECEIPT_CATEGORY,
+    categorySource: row.categorySource || 'AI',
+    categoryConfidence: row.categoryConfidence ?? null,
     confidence: row.confidence,
   });
 
@@ -1607,6 +1684,9 @@ router.post(
         const slipRaw = capRawText(
           visionTranscript || (i === 0 ? ocrOrHint : ''),
         );
+        const categoryFields = await addAiCategory(mapAiToReceiptFields(slip), slip);
+        slip.category = categoryFields.category;
+        slip.categorySource = categoryFields.categorySource;
         const { needsReview, reviewHint } = computeReceiptDraftReview(slip);
         const receiptId = await createReceiptDraft(req.auth.userId, {
           rawText: slipRaw,

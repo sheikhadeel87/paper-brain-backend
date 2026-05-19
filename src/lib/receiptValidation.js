@@ -37,19 +37,41 @@ export function isRollupReceiptLine(name, price, receiptTotal) {
   return false;
 }
 
+function numericOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n =
+    typeof value === 'number' && !Number.isNaN(value) ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function receiptLineAmount(item) {
+  if (!item || typeof item !== 'object') return null;
+  const price = numericOrNull(item.price);
+  if (price !== null) return price;
+  const qty = numericOrNull(item.qty);
+  const unitPrice = numericOrNull(item.unitPrice);
+  if (qty !== null && unitPrice !== null) return qty * unitPrice;
+  return null;
+}
+
+export function hasReceiptLineAmount(item) {
+  return receiptLineAmount(item) !== null;
+}
+
 function sumPricedLines(items, { skipRollups, receiptTotal }) {
   return items.reduce((acc, item) => {
-    if (!item || typeof item.price !== 'number' || Number.isNaN(item.price)) {
+    const amount = receiptLineAmount(item);
+    if (amount === null) {
       return acc;
     }
     if (
       skipRollups &&
       typeof item.name === 'string' &&
-      isRollupReceiptLine(item.name, item.price, receiptTotal)
+      isRollupReceiptLine(item.name, amount, receiptTotal)
     ) {
       return acc;
     }
-    return acc + item.price;
+    return acc + amount;
   }, 0);
 }
 
@@ -62,12 +84,7 @@ export function validateTotals(items, total, tax = null) {
   if (typeof t !== 'number' || Number.isNaN(t)) {
     return { sum: 0, isValid: false };
   }
-  const hasPricedLine = items.some(
-    (item) =>
-      item &&
-      typeof item.price === 'number' &&
-      !Number.isNaN(item.price),
-  );
+  const hasPricedLine = items.some(hasReceiptLineAmount);
   if (!hasPricedLine) {
     return { sum: 0, isValid: true };
   }
@@ -141,7 +158,7 @@ export function sanitizeItemPrices(items) {
     if (
       typeof price === 'number' &&
       !Number.isNaN(price) &&
-      (price <= 0 || price > 500)
+      price <= 0
     ) {
       return { ...item, price: null };
     }
@@ -196,12 +213,7 @@ export function applyReceiptValidation(aiData) {
 
   const validation = validateTotals(aiData.items, aiData.total, aiData.tax);
   const noItems = !aiData.items || aiData.items.length === 0;
-  const hasPricedLine = aiData.items.some(
-    (item) =>
-      item &&
-      typeof item.price === 'number' &&
-      !Number.isNaN(item.price),
-  );
+  const hasPricedLine = aiData.items.some(hasReceiptLineAmount);
 
   let score = guidelineReceiptConfidence(aiData);
   if (validation.isValid && hasPricedLine) {
