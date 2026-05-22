@@ -5,6 +5,7 @@ import { connectMongo } from './lib/mongoConnect.js'
 import authRoutes from './routes/auth.js'
 import expenseRoutes from './routes/expenses.js'
 import stripeRoutes from './routes/stripe.js'
+import whatsappRoutes from './routes/whatsapp.js'
 import { serve } from 'inngest/express'
 import { inngest } from './inngest/client.js'
 import { processReceiptWorkflow } from './inngest/functions/processReceiptWorkflow.js'
@@ -86,6 +87,10 @@ app.use(express.json())
 app.get('/health', (req, res) => {
   res.json({ status: 'OK' })
 })
+
+// Canonical WhatsApp webhook: /api/whatsapp/webhook (no DB connection needed).
+console.log('[whatsapp:webhook] canonical endpoint: /api/whatsapp/webhook')
+app.use('/api/whatsapp', whatsappRoutes)
 
 // Vercel serverless: `server.js` is not the entry, so this runs Mongo before /api.
 app.use('/api', async (req, res, next) => {

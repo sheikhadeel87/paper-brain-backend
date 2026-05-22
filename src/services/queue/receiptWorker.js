@@ -39,6 +39,13 @@ export const receiptWorker = receiptQueueEnabled
           )
           const name = job.data?.fileName ?? job.id
           const userId = job.data?.userId
+          console.log('[receiptWorker] job received', {
+            jobId: String(job.id),
+            name,
+            userId: userId || '',
+            hasFilePath: Boolean(job.data?.filePath),
+            hasImageUrl: Boolean(job.data?.imageUrl),
+          })
           const uid = String(userId || '').trim() || 'anonymous'
           const lockKey = `${USER_SERIAL_LOCK_PREFIX}${uid}`
           const lockVal = `${process.pid}:${String(job.id)}`
@@ -51,6 +58,10 @@ export const receiptWorker = receiptQueueEnabled
             'NX',
           )
           if (acquired !== 'OK') {
+            console.log('[receiptWorker] per-user lock busy; delaying job', {
+              jobId: String(job.id),
+              userId: uid,
+            })
             await job.moveToDelayed(
               Date.now() + USER_LOCK_RETRY_DELAY_MS,
               token,
@@ -92,6 +103,7 @@ if (receiptWorker) {
 
   receiptWorker.on('failed', (job, err) => {
     console.log(`❌ Job ${job?.id ?? 'unknown'} failed: ${err.message}`)
+    console.error('[receiptWorker] failed job stack:', err?.stack || err)
   })
 
   receiptWorker.on('error', (err) => {
