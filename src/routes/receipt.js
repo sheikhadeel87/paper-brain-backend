@@ -19,6 +19,7 @@ import {
 } from '../lib/receiptCategories.js';
 import { uploadReceiptImageBuffer, isCloudinaryConfigured } from '../services/cloudinaryUpload.js';
 import { categorizeReceipt } from '../services/receiptCategorization.js';
+import { detectDuplicateReceipt } from '../services/duplicateReceipt.service.js';
 import {
   advanceGeminiKeyIndexAfterQuota,
   advanceGeminiKeyIndexAfterSuccess,
@@ -650,6 +651,42 @@ async function addAiCategory(fields, aiData) {
   };
 }
 
+function duplicateResponseFromFields(fields) {
+  if (!fields?.possibleDuplicate) return null;
+  return {
+    possibleDuplicate: true,
+    confidenceScore: fields.duplicateConfidence || 0,
+    matchedReceipt: fields.duplicateMatchedReceipt || null,
+    duplicateReason: fields.duplicateReason || '',
+  };
+}
+
+async function addDuplicateMetadata(userId, fields, rawText) {
+  const result = await detectDuplicateReceipt(userId, {
+    ...fields,
+    rawText,
+  });
+  if (!result.possibleDuplicate) {
+    return {
+      ...fields,
+      possibleDuplicate: false,
+      duplicateConfidence: 0,
+      duplicateReceiptId: null,
+      duplicateReason: '',
+    };
+  }
+  return {
+    ...fields,
+    possibleDuplicate: true,
+    duplicateConfidence: result.confidenceScore,
+    duplicateReceiptId: result.matchedReceipt?.id
+      ? new mongoose.Types.ObjectId(result.matchedReceipt.id)
+      : null,
+    duplicateReason: result.duplicateReason,
+    duplicateMatchedReceipt: result.matchedReceipt,
+  };
+}
+
 export async function createReceiptDraft(
   userId,
   { rawText, aiData, aiParseFailed, needsReview, reviewHint = '', processingStatus } = {},
@@ -680,12 +717,27 @@ export async function createReceiptDraft(
         };
   if (aiData && typeof aiData === 'object' && !aiParseFailed) {
     fields = await addAiCategory(fields, aiData);
+    fields = await addDuplicateMetadata(userId, fields, base.rawText);
+    const duplicateWarning = duplicateResponseFromFields(fields);
+    if (duplicateWarning) {
+      aiData.duplicateWarning = duplicateWarning;
+      aiData.possibleDuplicate = true;
+      aiData.duplicateConfidence = fields.duplicateConfidence;
+      aiData.duplicateReceiptId = fields.duplicateReceiptId?.toString() || '';
+      aiData.duplicateReason = fields.duplicateReason;
+    }
   }
+  const duplicateMatchedReceipt = fields.duplicateMatchedReceipt;
+  delete fields.duplicateMatchedReceipt;
+  base.needsReview = base.needsReview || Boolean(fields.possibleDuplicate);
   const statusExtra =
     processingStatus && ['pending', 'processing', 'completed', 'failed'].includes(processingStatus)
       ? { processingStatus }
       : {};
   const doc = await Receipt.create({ ...base, ...fields, ...statusExtra });
+  if (aiData && duplicateMatchedReceipt && typeof aiData === 'object') {
+    aiData.duplicateWarning.matchedReceipt = duplicateMatchedReceipt;
+  }
   return doc._id.toString();
 }
 
@@ -1008,7 +1060,16 @@ export async function parseReceiptWithGemini(rawText, filePath, fileMeta) {
 }
 
 export async function parseReceiptWithGeminiFromUrl(rawText, imageUrl) {
+  console.log('[receipt:gemini] fetching image URL for Gemini', {
+    hasImageUrl: Boolean(imageUrl),
+    imageUrl,
+  });
   const res = await fetch(String(imageUrl), { redirect: 'follow' });
+  console.log('[receipt:gemini] image URL fetch response', {
+    status: res.status,
+    ok: res.ok,
+    contentType: res.headers.get('content-type') || '',
+  });
   if (!res.ok) {
     return {
       ok: false,
@@ -1020,10 +1081,22 @@ export async function parseReceiptWithGeminiFromUrl(rawText, imageUrl) {
   const mimeHeader = res.headers.get('content-type') || 'image/jpeg';
   const mimeType = mimeHeader.split(';')[0].trim() || 'image/jpeg';
   const buf = Buffer.from(await res.arrayBuffer());
+  console.log('[receipt:gemini] image loaded for Gemini', {
+    mimeType,
+    bytes: buf.length,
+  });
   const imagePart = {
     inlineData: { mimeType, data: buf.toString('base64') },
   };
-  return geminiVisionToReceipts(rawText, imagePart);
+  console.log('[receipt:gemini] OCR/Gemini parsing started');
+  const result = await geminiVisionToReceipts(rawText, imagePart);
+  console.log('[receipt:gemini] OCR/Gemini parsing finished', {
+    ok: Boolean(result?.ok),
+    receiptCount: Array.isArray(result?.receipts) ? result.receipts.length : 0,
+    code: result?.code || '',
+    error: result?.error || '',
+  });
+  return result;
 }
 
 export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId, gemini) {
@@ -1075,7 +1148,10 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
     const { needsReview, reviewHint } = computeReceiptDraftReview(slip);
     const hint =
       typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
-    const fields = await addAiCategory(mapAiToReceiptFields(slip), slip);
+    let fields = await addAiCategory(mapAiToReceiptFields(slip), slip);
+    fields = await addDuplicateMetadata(userId, fields, slipRaw);
+    const duplicateWarning = duplicateResponseFromFields(fields);
+    delete fields.duplicateMatchedReceipt;
 
     if (i === 0) {
       await Receipt.updateOne(
@@ -1085,7 +1161,7 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
             ...fields,
             rawText: slipRaw,
             aiParseFailed: false,
-            needsReview,
+            needsReview: needsReview || Boolean(duplicateWarning),
             reviewHint: hint,
             processingStatus: 'completed',
             processingError: '',
@@ -1134,13 +1210,34 @@ export async function persistAsyncReceiptUploadJob(
   gemini,
   { imageUrl, cloudinaryPublicId },
 ) {
+  console.log('[receipt:persist] persistAsyncReceiptUploadJob started', {
+    jobId: String(jobId),
+    userId: String(userId),
+    geminiOk: Boolean(gemini?.ok),
+    hasImageUrl: Boolean(imageUrl),
+    cloudinaryPublicId: cloudinaryPublicId || '',
+  });
   const uid = new mongoose.Types.ObjectId(userId);
   const job = await ReceiptUploadJob.findOne({ jobId: String(jobId), user: uid });
   if (!job) {
+    console.warn('[receipt:persist] upload job not found', {
+      jobId: String(jobId),
+      userId: String(userId),
+    });
     return { ok: false, receiptIds: [], code: 'JOB_NOT_FOUND' };
   }
+  console.log('[receipt:persist] upload job found', {
+    jobId: job.jobId,
+    status: job.status,
+    mongoId: job._id.toString(),
+  });
 
   const markFailed = async (processingError, code) => {
+    console.error('[receipt:persist] marking upload job failed', {
+      jobId: String(jobId),
+      code,
+      processingError,
+    });
     await ReceiptUploadJob.updateOne(
       { _id: job._id },
       {
@@ -1164,6 +1261,10 @@ export async function persistAsyncReceiptUploadJob(
   if (!Array.isArray(slips) || slips.length === 0) {
     return markFailed('No receipts extracted', 'EMPTY_RECEIPTS');
   }
+  console.log('[receipt:persist] parsed receipts ready to save', {
+    jobId: String(jobId),
+    slipCount: slips.length,
+  });
 
   const createdIds = [];
   const img = typeof imageUrl === 'string' ? imageUrl : '';
@@ -1171,6 +1272,13 @@ export async function persistAsyncReceiptUploadJob(
 
   for (let i = 0; i < slips.length; i += 1) {
     const slip = { ...slips[i] };
+    console.log('[receipt:persist] saving parsed receipt', {
+      jobId: String(jobId),
+      index: i,
+      vendor: slip.vendor || '',
+      total: slip.total ?? null,
+      currency: slip.currency || '',
+    });
     const visionTranscript =
       typeof slip.receiptText === 'string' ? String(slip.receiptText).trim() : '';
     delete slip.receiptText;
@@ -1190,6 +1298,10 @@ export async function persistAsyncReceiptUploadJob(
         cloudinaryPublicId: cid,
       });
       createdIds.push(id);
+      console.log('[receipt:persist] receipt draft created', {
+        jobId: String(jobId),
+        receiptId: String(id),
+      });
     } else {
       const newId = await createReceiptDraft(userId, {
         rawText: slipRaw,
@@ -1200,6 +1312,10 @@ export async function persistAsyncReceiptUploadJob(
         processingStatus: 'completed',
       });
       createdIds.push(newId);
+      console.log('[receipt:persist] additional receipt draft created', {
+        jobId: String(jobId),
+        receiptId: String(newId),
+      });
     }
   }
 
@@ -1221,6 +1337,10 @@ export async function persistAsyncReceiptUploadJob(
       },
     },
   );
+  console.log('[receipt:persist] upload job completed', {
+    jobId: String(jobId),
+    receiptIds: createdIds,
+  });
 
   return { ok: true, receiptIds: createdIds };
 }
@@ -1273,6 +1393,18 @@ async function sendResolvedReceiptDraftStatus(res, userId, primary) {
     category: row.category || DEFAULT_RECEIPT_CATEGORY,
     categorySource: row.categorySource || 'AI',
     categoryConfidence: row.categoryConfidence ?? null,
+    possibleDuplicate: Boolean(row.possibleDuplicate),
+    duplicateConfidence: row.duplicateConfidence || 0,
+    duplicateReceiptId: row.duplicateReceiptId ? String(row.duplicateReceiptId) : '',
+    duplicateReason: row.duplicateReason || '',
+    duplicateWarning: row.possibleDuplicate
+      ? {
+          possibleDuplicate: true,
+          confidenceScore: row.duplicateConfidence || 0,
+          duplicateReason: row.duplicateReason || '',
+          matchedReceipt: null,
+        }
+      : null,
     confidence: row.confidence,
   });
 
@@ -1700,7 +1832,8 @@ router.post(
           aiData: { ...slip },
           rawText: slipRaw,
           reviewHint,
-          needsReview,
+          duplicateWarning: slip.duplicateWarning || null,
+          needsReview: needsReview || Boolean(slip.duplicateWarning),
         });
       }
 
@@ -1720,12 +1853,15 @@ router.post(
           needsReview: needsReviewAny,
           receiptId: first.receiptId,
           receiptIds: created.map((c) => c.receiptId),
+          duplicateWarning: first.duplicateWarning || null,
           multiReceipt: created.length > 1,
           receipts: created.map((c) => ({
             receiptId: c.receiptId,
             aiData: c.aiData,
             rawText: c.rawText,
             reviewHint: c.reviewHint,
+            duplicateWarning: c.duplicateWarning || null,
+            needsReview: Boolean(c.needsReview),
           })),
         }),
       );

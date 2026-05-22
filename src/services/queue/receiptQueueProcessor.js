@@ -46,12 +46,24 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
   const fromCloudinaryUrl = Boolean(imageUrl) && !filePath
   let tempFile = null
 
+  console.log('[receiptQueueProcessor] job processing started', {
+    userId: userId || '',
+    fileName: fileName || '',
+    hasFilePath: Boolean(filePath),
+    hasImageUrl: Boolean(imageUrl),
+    cloudinaryPublicId,
+    applyMinSlot,
+  })
+
   try {
     let rawText = ''
     let ocrFailed = true
     let gemini
 
     if (fromCloudinaryUrl) {
+      console.log('[receiptQueueProcessor] parsing Cloudinary image URL with Gemini', {
+        imageUrl,
+      })
       rawText = ''
       ocrFailed = false
       gemini = await parseReceiptWithGeminiFromUrl('', imageUrl)
@@ -60,6 +72,7 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         throw new Error('Queue job missing filePath and imageUrl')
       }
       if (receiptTesseractEnabled()) {
+        console.log('[receiptQueueProcessor] Tesseract OCR started', { filePath })
         const prep = await prepareImageForOcr(filePath)
         const { ocrPath } = prep
         tempFile = prep.tempFile
@@ -67,7 +80,12 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
           const ocr = await runReceiptOcr(ocrPath)
           rawText = typeof ocr.rawText === 'string' ? ocr.rawText : ''
           ocrFailed = Boolean(ocr.ocrFailed)
-        } catch {
+          console.log('[receiptQueueProcessor] Tesseract OCR finished', {
+            ocrFailed,
+            rawTextLength: rawText.length,
+          })
+        } catch (err) {
+          console.error('[receiptQueueProcessor] Tesseract OCR failed:', err?.stack || err)
           rawText = ''
           ocrFailed = true
         }
@@ -81,6 +99,12 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         mimetype: '',
       })
     }
+    console.log('[receiptQueueProcessor] Gemini result received', {
+      ok: Boolean(gemini?.ok),
+      receiptCount: Array.isArray(gemini?.receipts) ? gemini.receipts.length : 0,
+      code: gemini?.code || '',
+      error: gemini?.error || '',
+    })
 
     if (!gemini.ok) {
       const reason =
@@ -101,6 +125,13 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
     for (let i = 0; i < gemini.receipts.length; i += 1) {
       const slip = gemini.receipts[i]
       const aiData = { ...slip }
+      console.log('[receiptQueueProcessor] parsed receipt data', {
+        index: i,
+        vendor: aiData.vendor || '',
+        total: aiData.total ?? null,
+        currency: aiData.currency || '',
+        itemCount: Array.isArray(aiData.items) ? aiData.items.length : 0,
+      })
       const visionTranscript =
         typeof aiData.receiptText === 'string'
           ? String(aiData.receiptText).trim()
@@ -137,8 +168,18 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
       }
       const receiptId = await createReceiptDraft(userId, draftOpts)
       receiptIds.push(String(receiptId))
+      console.log('[receiptQueueProcessor] receipt draft saved', {
+        receiptId: String(receiptId),
+      })
       if (reviewHint) {
         warnings.push({ receiptId: String(receiptId), message: reviewHint })
+      }
+      if (slipForDb.duplicateWarning) {
+        warnings.push({
+          receiptId: String(receiptId),
+          message: 'Possible duplicate receipt detected.',
+          duplicateWarning: slipForDb.duplicateWarning,
+        })
       }
       const confidence =
         typeof slipForDb.confidence === 'number' &&
@@ -156,6 +197,10 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         confidenceFlag,
         isCorrected: false,
         status: 'approved',
+      })
+      console.log('[receiptQueueProcessor] expense save success', {
+        expenseId: String(expense._id),
+        receiptId: String(receiptId),
       })
       await Receipt.updateOne(
         { _id: receiptId, user: userId },

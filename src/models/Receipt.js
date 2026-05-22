@@ -47,6 +47,14 @@ const receiptSchema = new mongoose.Schema(
       default: 'AI',
     },
     categoryConfidence: { type: Number, default: null },
+    possibleDuplicate: { type: Boolean, default: false },
+    duplicateConfidence: { type: Number, default: 0 },
+    duplicateReceiptId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Receipt',
+      default: null,
+    },
+    duplicateReason: { type: String, default: '' },
     confidence: { type: Number, default: 0 },
     /** Shown in the app when totals do not reconcile or the worker flagged the draft. */
     reviewHint: { type: String, default: '' },
