@@ -17,6 +17,11 @@ import {
   isReceiptCategory,
   normalizeReceiptCategory,
 } from '../lib/receiptCategories.js';
+import {
+  dataAccessFilter,
+  resolveUserAccessScope,
+  scopedDocumentFilter,
+} from '../lib/accessScope.js';
 import { uploadReceiptImageBuffer, isCloudinaryConfigured } from '../services/cloudinaryUpload.js';
 import { categorizeReceipt } from '../services/receiptCategorization.js';
 import { detectDuplicateReceipt } from '../services/duplicateReceipt.service.js';
@@ -31,6 +36,8 @@ import { Receipt } from '../models/Receipt.js';
 import { Expense } from '../models/Expense.js';
 import { ReceiptUploadJob } from '../models/ReceiptUploadJob.js';
 import { User } from '../models/User.js';
+import { Organization } from '../models/Organization.js';
+import { Branch } from '../models/Branch.js';
 import {
   freeTierLimitJson,
   getReceiptUploadUsage,
@@ -131,6 +138,143 @@ async function enforceReceiptUploadLimit(res, userId, plan, slots) {
   return true;
 }
 
+function objectIdOrNull(value) {
+  const id = value ? String(value) : '';
+  return mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null;
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function applyReceiptOrgFilters(filter, scope, query) {
+  if (scope.isAdmin) {
+    const branchId = objectIdOrNull(query?.branchId);
+    if (branchId) filter.branchId = branchId;
+  }
+
+  const uploadedBy = objectIdOrNull(query?.uploadedBy);
+  if (uploadedBy) {
+    filter.uploadedBy = uploadedBy;
+    return;
+  }
+
+  const manager =
+    typeof query?.manager === 'string' ? query.manager.trim() : '';
+  if (!manager) return;
+
+  const users = await User.find({
+    organizationId: scope.organizationId,
+    role: 'MANAGER',
+    $or: [
+      { name: new RegExp(escapeRegex(manager), 'i') },
+      { email: new RegExp(escapeRegex(manager), 'i') },
+    ],
+  })
+    .select('_id')
+    .lean();
+  filter.uploadedBy = { $in: users.map((u) => u._id) };
+}
+
+function branchJson(branch) {
+  if (!branch || typeof branch !== 'object') return null;
+  return {
+    id: branch._id?.toString?.() || '',
+    name: branch.name || '',
+    location: branch.location || '',
+  };
+}
+
+function uploaderJson(user) {
+  if (!user || typeof user !== 'object') return null;
+  return {
+    id: user._id?.toString?.() || '',
+    name: user.name || '',
+    email: user.email || '',
+    role: user.role || '',
+  };
+}
+
+function enrichReceiptRow(row) {
+  return {
+    ...row,
+    branch: branchJson(row.branchId),
+    uploadedByUser: uploaderJson(row.uploadedBy),
+  };
+}
+
+async function defaultBranchForOrganization(organizationId) {
+  const orgId = objectIdOrNull(organizationId);
+  if (!orgId) return null;
+
+  const existing = await Branch.findOne({ organizationId: orgId }).sort({ createdAt: 1 });
+  if (existing?._id) return existing._id;
+
+  const branch = await Branch.create({
+    organizationId: orgId,
+    name: 'Main Branch',
+    location: '',
+  });
+  return branch._id;
+}
+
+async function resolveReceiptScope(userId, requestedBranchId = '') {
+  const uid = objectIdOrNull(userId);
+  if (!uid) throw new Error('Invalid user for receipt upload.');
+
+  const user = await User.findById(uid).select('name organizationId branchId role');
+  if (!user) throw new Error('User not found for receipt upload.');
+
+  let organizationId = objectIdOrNull(user.organizationId);
+  if (!organizationId) {
+    const organization = await Organization.create({
+      name: user.name ? `${user.name}'s Organization` : 'Paper Brain Organization',
+      ownerId: uid,
+      currency: 'PKR',
+    });
+    organizationId = organization._id;
+  }
+
+  let branchId = null;
+  const role = user.role === 'MANAGER' ? 'MANAGER' : 'ADMIN';
+
+  if (role === 'MANAGER') {
+    branchId = objectIdOrNull(user.branchId);
+  } else {
+    const requested = objectIdOrNull(requestedBranchId);
+    if (requested) {
+      const branch = await Branch.findOne({
+        _id: requested,
+        organizationId,
+      }).select('_id');
+      branchId = branch?._id || null;
+    }
+  }
+
+  if (!branchId) {
+    branchId = await defaultBranchForOrganization(organizationId);
+  }
+
+  const update = {};
+  if (!user.organizationId || String(user.organizationId) !== String(organizationId)) {
+    update.organizationId = organizationId;
+  }
+  if (role === 'MANAGER' && branchId && String(user.branchId || '') !== String(branchId)) {
+    update.branchId = branchId;
+  }
+  if (Object.keys(update).length > 0) {
+    await User.updateOne({ _id: uid }, { $set: update });
+  }
+
+  if (!branchId) throw new Error('Could not resolve branch for receipt upload.');
+
+  return {
+    organizationId,
+    branchId,
+    uploadedBy: uid,
+  };
+}
+
 router.get('/upload-quota', async (req, res) => {
   try {
     const userId = req.auth?.userId;
@@ -170,6 +314,8 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
       return;
     }
 
+    const receiptScope = await resolveReceiptScope(userId, req.body?.branchId);
+
     const fileNames = files.map((f) =>
       typeof f.originalname === 'string' ? f.originalname : '',
     );
@@ -180,6 +326,9 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
         fileName: file.originalname,
         filePath: file.path,
         userId,
+        organizationId: receiptScope.organizationId.toString(),
+        branchId: receiptScope.branchId.toString(),
+        uploadedBy: receiptScope.uploadedBy.toString(),
         status: 'pending',
       },
     }));
@@ -220,6 +369,9 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
             filePath: file.path,
             fileName: name,
             userId,
+            organizationId: receiptScope.organizationId.toString(),
+            branchId: receiptScope.branchId.toString(),
+            uploadedBy: receiptScope.uploadedBy.toString(),
           },
           { applyMinSlot: true },
         );
@@ -468,19 +620,27 @@ router.get('/drafts', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
+    const scope = await resolveUserAccessScope(userId, req.query?.branchId);
     const { limit, skip } = parseReceiptDraftsQuery(req.query);
     const filter = {
-      user: new mongoose.Types.ObjectId(userId),
+      ...dataAccessFilter(scope),
       /** Omit in-flight async rows; BullMQ path creates Receipt only after Gemini (no pending rows). */
       processingStatus: { $nin: ['pending', 'processing'] },
     };
+    await applyReceiptOrgFilters(filter, scope, req.query);
     const [receipts, totalCount] = await Promise.all([
-      Receipt.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Receipt.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('branchId', 'name location')
+        .populate('uploadedBy', 'name email role')
+        .lean(),
       Receipt.countDocuments(filter),
     ]);
     return res.json({
       success: true,
-      receipts,
+      receipts: receipts.map(enrichReceiptRow),
       totalCount,
       limit,
       skip,
@@ -507,9 +667,10 @@ router.patch('/:id/category', async (req, res) => {
     if (!isReceiptCategory(rawCategory)) {
       return res.status(400).json({ success: false, error: 'Invalid category.' });
     }
+    const scope = await resolveUserAccessScope(userId);
 
     const receipt = await Receipt.findOneAndUpdate(
-      { _id: id, user: new mongoose.Types.ObjectId(userId) },
+      scopedDocumentFilter(scope, { _id: id }),
       { $set: { category, categorySource: 'MANUAL' } },
       { returnDocument: 'after', runValidators: true },
     ).lean();
@@ -520,7 +681,7 @@ router.patch('/:id/category', async (req, res) => {
 
     if (receipt.expense) {
       await Expense.updateOne(
-        { _id: receipt.expense, user: new mongoose.Types.ObjectId(userId) },
+        scopedDocumentFilter(scope, { _id: receipt.expense }),
         {
           $set: {
             'finalData.category': category,
@@ -689,12 +850,31 @@ async function addDuplicateMetadata(userId, fields, rawText) {
 
 export async function createReceiptDraft(
   userId,
-  { rawText, aiData, aiParseFailed, needsReview, reviewHint = '', processingStatus } = {},
+  {
+    rawText,
+    aiData,
+    aiParseFailed,
+    needsReview,
+    reviewHint = '',
+    processingStatus,
+    organizationId,
+    branchId,
+    uploadedBy,
+  } = {},
 ) {
   const hint =
     typeof reviewHint === 'string' ? reviewHint.trim().slice(0, 2000) : '';
+  const scope =
+    objectIdOrNull(organizationId) && objectIdOrNull(branchId) && objectIdOrNull(uploadedBy)
+      ? {
+          organizationId: objectIdOrNull(organizationId),
+          branchId: objectIdOrNull(branchId),
+          uploadedBy: objectIdOrNull(uploadedBy),
+        }
+      : await resolveReceiptScope(userId, branchId);
   const base = {
     user: new mongoose.Types.ObjectId(userId),
+    ...scope,
     rawText: typeof rawText === 'string' ? rawText : '',
     aiParseFailed: Boolean(aiParseFailed),
     needsReview: Boolean(needsReview),
@@ -1138,6 +1318,7 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
   }
 
   const createdIds = [];
+  const receiptScope = await resolveReceiptScope(userId);
 
   for (let i = 0; i < slips.length; i += 1) {
     const slip = { ...slips[i] };
@@ -1159,6 +1340,7 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
         {
           $set: {
             ...fields,
+            ...receiptScope,
             rawText: slipRaw,
             aiParseFailed: false,
             needsReview: needsReview || Boolean(duplicateWarning),
@@ -1178,6 +1360,7 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
         needsReview,
         reviewHint: hint,
         processingStatus: 'completed',
+        ...receiptScope,
       });
       createdIds.push(String(newId));
     }
@@ -1231,6 +1414,14 @@ export async function persistAsyncReceiptUploadJob(
     status: job.status,
     mongoId: job._id.toString(),
   });
+  const receiptScope =
+    job.organizationId && job.branchId && job.uploadedBy
+      ? {
+          organizationId: job.organizationId,
+          branchId: job.branchId,
+          uploadedBy: job.uploadedBy,
+        }
+      : await resolveReceiptScope(userId);
 
   const markFailed = async (processingError, code) => {
     console.error('[receipt:persist] marking upload job failed', {
@@ -1296,6 +1487,7 @@ export async function persistAsyncReceiptUploadJob(
         processingStatus: 'completed',
         imageUrl: img,
         cloudinaryPublicId: cid,
+        ...receiptScope,
       });
       createdIds.push(id);
       console.log('[receipt:persist] receipt draft created', {
@@ -1310,6 +1502,7 @@ export async function persistAsyncReceiptUploadJob(
         needsReview,
         reviewHint: hint,
         processingStatus: 'completed',
+        ...receiptScope,
       });
       createdIds.push(newId);
       console.log('[receipt:persist] additional receipt draft created', {
@@ -1621,6 +1814,7 @@ router.post(
         if (filePath) await fsp.unlink(filePath).catch(() => {});
         return;
       }
+      const receiptScope = await resolveReceiptScope(userId, req.body?.branchId);
 
       if (receiptBullAsyncUploadEnabled()) {
         const buf = req.file.buffer;
@@ -1647,6 +1841,9 @@ router.post(
                 ? req.file.originalname
                 : 'receipt',
             userId,
+            organizationId: receiptScope.organizationId.toString(),
+            branchId: receiptScope.branchId.toString(),
+            uploadedBy: receiptScope.uploadedBy.toString(),
             imageUrl: url,
             cloudinaryPublicId: publicId,
           });
@@ -1696,6 +1893,9 @@ router.post(
           await ReceiptUploadJob.create({
             jobId,
             user: new mongoose.Types.ObjectId(userId),
+            organizationId: receiptScope.organizationId,
+            branchId: receiptScope.branchId,
+            uploadedBy: receiptScope.uploadedBy,
             imageUrl: url,
             cloudinaryPublicId: typeof publicId === 'string' ? publicId : '',
             status: 'queued',
@@ -1706,6 +1906,9 @@ router.post(
               jobId,
               imageUrl: url,
               userId: String(userId),
+              organizationId: receiptScope.organizationId.toString(),
+              branchId: receiptScope.branchId.toString(),
+              uploadedBy: receiptScope.uploadedBy.toString(),
               cloudinaryPublicId: typeof publicId === 'string' ? publicId : '',
             },
           });
@@ -1788,6 +1991,9 @@ router.post(
           aiData: null,
           aiParseFailed: true,
           needsReview: true,
+          organizationId: receiptScope.organizationId,
+          branchId: receiptScope.branchId,
+          uploadedBy: receiptScope.uploadedBy,
         });
         return res.status(200).json(
           receiptJson({
@@ -1826,6 +2032,9 @@ router.post(
           aiParseFailed: false,
           needsReview,
           reviewHint,
+          organizationId: receiptScope.organizationId,
+          branchId: receiptScope.branchId,
+          uploadedBy: receiptScope.uploadedBy,
         });
         created.push({
           receiptId,

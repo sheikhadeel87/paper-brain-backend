@@ -2,6 +2,7 @@ import express from 'express';
 import mongoose from 'mongoose';
 import { Expense } from '../models/Expense.js';
 import { Receipt } from '../models/Receipt.js';
+import { User } from '../models/User.js';
 import {
   applyReceiptValidation,
   hasReceiptLineAmount,
@@ -11,6 +12,12 @@ import {
   isReceiptCategory,
   normalizeReceiptCategory,
 } from '../lib/receiptCategories.js';
+import {
+  dataAccessFilter,
+  objectIdOrNull,
+  resolveUserAccessScope,
+  scopedDocumentFilter,
+} from '../lib/accessScope.js';
 import { processTimingMiddleware } from '../middleware/processTiming.js';
 import { requireAuth } from '../middleware/requireAuth.js';
 
@@ -18,12 +25,173 @@ const router = express.Router();
 router.use(processTimingMiddleware);
 router.use(requireAuth);
 
-function expenseFilterForUser(req, query) {
+async function expenseFilterForUser(req, query) {
+  const scope = await resolveUserAccessScope(req.auth.userId, query?.branchId);
+  await repairMissingExpensesFromParsedReceipts(scope);
+  await backfillExpenseScopesFromReceipts(scope);
   const base = buildExpenseFilter(query);
-  return {
+  const filter = {
     ...base,
-    user: new mongoose.Types.ObjectId(req.auth.userId),
+    ...dataAccessFilter(scope),
   };
+  await applyOrgPeopleFilters(filter, scope, query);
+  return filter;
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function applyOrgPeopleFilters(filter, scope, query) {
+  if (scope.isAdmin) {
+    const branchId = objectIdOrNull(query?.branchId);
+    if (branchId) filter.branchId = branchId;
+  }
+
+  const uploadedBy = objectIdOrNull(query?.uploadedBy);
+  if (uploadedBy) {
+    filter.uploadedBy = uploadedBy;
+    return;
+  }
+
+  const manager =
+    typeof query?.manager === 'string' ? query.manager.trim() : '';
+  if (!manager) return;
+
+  const users = await User.find({
+    organizationId: scope.organizationId,
+    role: 'MANAGER',
+    $or: [
+      { name: new RegExp(escapeRegex(manager), 'i') },
+      { email: new RegExp(escapeRegex(manager), 'i') },
+    ],
+  })
+    .select('_id')
+    .lean();
+  filter.uploadedBy = { $in: users.map((u) => u._id) };
+}
+
+function branchJson(branch) {
+  if (!branch || typeof branch !== 'object') return null;
+  return {
+    id: branch._id?.toString?.() || '',
+    name: branch.name || '',
+    location: branch.location || '',
+  };
+}
+
+function uploaderJson(user) {
+  if (!user || typeof user !== 'object') return null;
+  return {
+    id: user._id?.toString?.() || '',
+    name: user.name || '',
+    email: user.email || '',
+    role: user.role || '',
+  };
+}
+
+function enrichExpenseRow(row) {
+  return {
+    ...row,
+    branch: branchJson(row.branchId),
+    uploadedByUser: uploaderJson(row.uploadedBy),
+  };
+}
+
+function finalDataFromReceipt(receipt) {
+  return {
+    vendor: receipt.vendor || '',
+    total: receipt.total ?? null,
+    currency: receipt.currency || 'USD',
+    date: receipt.date || null,
+    tax: receipt.tax ?? null,
+    items: Array.isArray(receipt.items) ? receipt.items : [],
+    category: receipt.category,
+    categorySource: receipt.categorySource,
+    categoryConfidence: receipt.categoryConfidence ?? null,
+  };
+}
+
+async function repairMissingExpensesFromParsedReceipts(scope) {
+  const receipts = await Receipt.find({
+    ...dataAccessFilter(scope),
+    expense: null,
+    aiParseFailed: { $ne: true },
+    processingStatus: { $nin: ['pending', 'processing', 'failed'] },
+    $or: [{ vendor: { $ne: null } }, { total: { $ne: null } }],
+  })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .lean();
+
+  for (const receipt of receipts) {
+    if (!receipt.organizationId || !receipt.branchId) continue;
+    const finalData = finalDataFromReceipt(receipt);
+    const confidence =
+      typeof receipt.confidence === 'number' && !Number.isNaN(receipt.confidence)
+        ? receipt.confidence
+        : 0;
+    const expense = await Expense.create({
+      user: receipt.user,
+      organizationId: receipt.organizationId,
+      branchId: receipt.branchId,
+      uploadedBy: receipt.uploadedBy || receipt.user,
+      rawText: typeof receipt.rawText === 'string' ? receipt.rawText : '',
+      originalAiData: finalData,
+      finalData,
+      confidence,
+      confidenceFlag: confidence >= 80 && !receipt.needsReview ? 'auto' : 'review',
+      isCorrected: false,
+      status: 'approved',
+    });
+    await Receipt.updateOne(
+      {
+        _id: receipt._id,
+        expense: null,
+      },
+      { $set: { expense: expense._id } },
+    );
+  }
+}
+
+async function backfillExpenseScopesFromReceipts(scope) {
+  const receipts = await Receipt.find({
+    ...dataAccessFilter(scope),
+    expense: { $ne: null },
+  })
+    .select('expense organizationId branchId uploadedBy user')
+    .lean();
+
+  const writes = [];
+  for (const receipt of receipts) {
+    if (!receipt.expense || !receipt.organizationId || !receipt.branchId) continue;
+    writes.push({
+      updateOne: {
+        filter: {
+          _id: receipt.expense,
+          $or: [
+            { organizationId: { $exists: false } },
+            { organizationId: null },
+            { branchId: { $exists: false } },
+            { branchId: null },
+            { uploadedBy: { $exists: false } },
+            { uploadedBy: null },
+          ],
+        },
+        update: {
+          $set: {
+            organizationId: receipt.organizationId,
+            branchId: receipt.branchId,
+            uploadedBy: receipt.uploadedBy || receipt.user,
+          },
+        },
+      },
+    });
+  }
+
+  if (writes.length > 0) {
+    await Expense.bulkWrite(writes, { ordered: false });
+  }
 }
 
 function cloneJson(value) {
@@ -32,10 +200,6 @@ function cloneJson(value) {
   } catch {
     return JSON.parse(JSON.stringify(value));
   }
-}
-
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /** Query: `from`, `to` (YYYY-MM-DD on `createdAt`), `vendor`, `confidenceFlag`, `category`. */
@@ -140,6 +304,9 @@ function expensesToCsv(rows) {
     'total',
     'currency',
     'category',
+    'branch',
+    'uploadedByName',
+    'uploadedByEmail',
     'tax',
     'confidence',
     'confidenceFlag',
@@ -149,6 +316,8 @@ function expensesToCsv(rows) {
   const lines = [headers.join(',')];
   for (const ex of rows) {
     const fd = ex.finalData && typeof ex.finalData === 'object' ? ex.finalData : {};
+    const branch = ex.branchId && typeof ex.branchId === 'object' ? ex.branchId : null;
+    const uploadedBy = ex.uploadedBy && typeof ex.uploadedBy === 'object' ? ex.uploadedBy : null;
     const rt = typeof ex.rawText === 'string' ? ex.rawText : '';
     const rtShort = rt.length > 2000 ? `${rt.slice(0, 2000)}…` : rt;
     const created =
@@ -166,6 +335,9 @@ function expensesToCsv(rows) {
         csvEscape(fd.total),
         csvEscape(fd.currency),
         csvEscape(fd.category),
+        csvEscape(branch?.name || ''),
+        csvEscape(uploadedBy?.name || ''),
+        csvEscape(uploadedBy?.email || ''),
         csvEscape(fd.tax),
         csvEscape(ex.confidence ?? fd.confidence),
         csvEscape(ex.confidenceFlag ?? fd.confidence_flag),
@@ -179,10 +351,12 @@ function expensesToCsv(rows) {
 
 router.get('/export', async (req, res) => {
   try {
-    const filter = expenseFilterForUser(req, req.query);
+    const filter = await expenseFilterForUser(req, req.query);
     const rows = await Expense.find(filter)
       .sort({ createdAt: -1 })
       .limit(2000)
+      .populate('branchId', 'name location')
+      .populate('uploadedBy', 'name email role')
       .lean();
     const csv = expensesToCsv(rows);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -196,20 +370,22 @@ router.get('/export', async (req, res) => {
 
 router.get('/', async (req, res) => {
   try {
-    const filter = expenseFilterForUser(req, req.query);
+    const filter = await expenseFilterForUser(req, req.query);
     const { limit, skip } = parseLimitSkip(req.query);
     const [expenses, totalCount, summary] = await Promise.all([
       Expense.find(filter)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
+        .populate('branchId', 'name location')
+        .populate('uploadedBy', 'name email role')
         .lean(),
       Expense.countDocuments(filter),
       spendingSummary(filter),
     ]);
     return res.json({
       success: true,
-      expenses,
+      expenses: expenses.map(enrichExpenseRow),
       totalCount,
       summary,
       limit,
@@ -377,14 +553,20 @@ router.post('/', async (req, res) => {
   const v = prep.value;
 
   try {
+    const scope = await resolveUserAccessScope(req.auth.userId, req.body?.branchId);
     let pendingReceipt = null;
+    let expenseScope = {
+      organizationId: scope.organizationId,
+      branchId: scope.branchId,
+      uploadedBy: scope.userId,
+    };
     if (v.receiptObjectId) {
       pendingReceipt = await Receipt.findOne({
         _id: v.receiptObjectId,
-        user: req.auth.userId,
         expense: null,
+        ...dataAccessFilter(scope),
       })
-        .select('_id category categorySource')
+        .select('_id category categorySource organizationId branchId uploadedBy')
         .lean();
       if (!pendingReceipt) {
         return res.status(400).json({
@@ -396,10 +578,18 @@ router.post('/', async (req, res) => {
         v.normalized.category = normalizeReceiptCategory(pendingReceipt.category);
         v.normalized.categorySource = pendingReceipt.categorySource || 'AI';
       }
+      expenseScope = {
+        organizationId: pendingReceipt.organizationId || scope.organizationId,
+        branchId: pendingReceipt.branchId || scope.branchId,
+        uploadedBy: pendingReceipt.uploadedBy || scope.userId,
+      };
     }
 
     const expense = await Expense.create({
       user: req.auth.userId,
+      organizationId: expenseScope.organizationId,
+      branchId: expenseScope.branchId,
+      uploadedBy: expenseScope.uploadedBy,
       rawText: v.rawText,
       originalAiData: v.original,
       finalData: v.normalized,
@@ -411,7 +601,7 @@ router.post('/', async (req, res) => {
 
     if (v.receiptObjectId) {
       await Receipt.updateOne(
-        { _id: v.receiptObjectId, user: req.auth.userId },
+        scopedDocumentFilter(scope, { _id: v.receiptObjectId }),
         { $set: { expense: expense._id } },
       );
     }
@@ -441,8 +631,9 @@ router.patch('/:id', async (req, res) => {
   const v = prep.value;
 
   try {
+    const scope = await resolveUserAccessScope(req.auth.userId);
     const expense = await Expense.findOneAndUpdate(
-      { _id: id, user: req.auth.userId },
+      scopedDocumentFilter(scope, { _id: id }),
       {
         $set: {
           rawText: v.rawText,
@@ -479,9 +670,10 @@ router.delete('/:id', async (req, res) => {
   }
 
   try {
+    const scope = await resolveUserAccessScope(req.auth.userId);
     const deleted = await Expense.findOneAndDelete({
       _id: id,
-      user: req.auth.userId,
+      ...dataAccessFilter(scope),
     }).lean();
     if (!deleted) {
       return res.status(404).json({ success: false, error: 'Expense not found.' });

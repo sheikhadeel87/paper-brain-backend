@@ -23,6 +23,24 @@ const receiptSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      required: true,
+      index: true,
+    },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
     /** Set when the user confirms an expense from this draft. */
     expense: {
       type: mongoose.Schema.Types.ObjectId,

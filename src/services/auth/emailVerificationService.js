@@ -31,8 +31,7 @@ export async function verifyEmailWithToken(token) {
   const user = await User.findOne({
     _id: userId,
     email,
-    verificationToken: token,
-  });
+  }).select('+verificationToken');
 
   if (!user) {
     const err = new Error('Invalid or expired verification link.');
@@ -42,6 +41,12 @@ export async function verifyEmailWithToken(token) {
 
   if (user.isVerified) {
     return { alreadyVerified: true, email: user.email };
+  }
+
+  if (user.verificationToken !== token) {
+    const err = new Error('Invalid or expired verification link.');
+    err.status = 400;
+    throw err;
   }
 
   user.isVerified = true;

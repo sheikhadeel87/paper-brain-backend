@@ -1,10 +1,9 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import { User } from '../models/User.js';
 import { requireAuth } from '../middleware/requireAuth.js';
-import { JWT_SECRET } from '../lib/jwtSecret.js';
+import { signAuthToken, userJson } from '../lib/authSession.js';
 import { repairUserSubscriptionPeriodEnd } from './stripe.js';
 import {
   issueAndSendVerification,
@@ -13,32 +12,6 @@ import {
 } from '../services/auth/emailVerificationService.js';
 
 const router = express.Router();
-
-function signToken(user) {
-  return jwt.sign(
-    {
-      sub: String(user._id),
-      email: user.email,
-      name: user.name,
-    },
-    JWT_SECRET,
-    { expiresIn: '7d' },
-  );
-}
-
-function userJson(doc) {
-  const id = doc._id != null ? String(doc._id) : String(doc.id);
-  return {
-    id,
-    email: doc.email,
-    name: doc.name,
-    isVerified: doc.isVerified !== false,
-    plan: doc.plan || 'free',
-    subscriptionStatus: doc.subscriptionStatus || 'free',
-    subscriptionCurrentPeriodEnd: doc.subscriptionCurrentPeriodEnd || null,
-    subscriptionCancelAtPeriodEnd: Boolean(doc.subscriptionCancelAtPeriodEnd),
-  };
-}
 
 router.post('/register', async (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
@@ -107,7 +80,7 @@ router.post('/login', async (req, res, next) => {
         code: 'EMAIL_NOT_VERIFIED',
       });
     }
-    const token = signToken(user);
+    const token = signAuthToken(user);
     return res.json({ success: true, token, user: userJson(user) });
   } catch (err) {
     return next(err);
@@ -165,7 +138,7 @@ router.get('/me', requireAuth, async (req, res) => {
     }
     let user = await User.findById(req.auth.userId)
       .select(
-        'name email isVerified plan stripeSubscriptionId subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
+        'name email isVerified organizationId branchId role status plan stripeSubscriptionId subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
       )
       .lean();
     if (!user) {
@@ -179,7 +152,7 @@ router.get('/me', requireAuth, async (req, res) => {
       await repairUserSubscriptionPeriodEnd(req.auth.userId);
       user = await User.findById(req.auth.userId)
         .select(
-          'name email isVerified plan subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
+          'name email isVerified organizationId branchId role status plan subscriptionStatus subscriptionCurrentPeriodEnd subscriptionCancelAtPeriodEnd',
         )
         .lean();
     }
