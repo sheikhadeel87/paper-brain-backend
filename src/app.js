@@ -3,8 +3,10 @@ import express from 'express'
 import cors from 'cors'
 import { connectMongo } from './lib/mongoConnect.js'
 import authRoutes from './routes/auth.js'
+import branchRoutes from './routes/branches.js'
 import expenseRoutes from './routes/expenses.js'
 import stripeRoutes from './routes/stripe.js'
+import teamRoutes from './routes/teams.js'
 import whatsappRoutes from './routes/whatsapp.js'
 import { serve } from 'inngest/express'
 import { inngest } from './inngest/client.js'
@@ -114,6 +116,8 @@ app.use('/api', async (req, res, next) => {
 })
 
 app.use('/api/auth', authRoutes)
+app.use('/api/branches', branchRoutes)
+app.use('/api/teams', teamRoutes)
 app.use('/api/stripe', stripeRoutes)
 app.use(
   '/api/inngest',

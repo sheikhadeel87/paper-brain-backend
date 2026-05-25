@@ -8,6 +8,24 @@ const expenseSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: true,
+      index: true,
+    },
+    branchId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Branch',
+      required: true,
+      index: true,
+    },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
     rawText: { type: String, default: '' },
     /** Full Gemini JSON as returned (or `{ aiParseFailed: true }` when user saved after AI failure). */
     originalAiData: { type: mongoose.Schema.Types.Mixed, required: true },

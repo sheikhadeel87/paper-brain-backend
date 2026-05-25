@@ -39,6 +39,9 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
     userId,
     imageUrl: imageUrlIn,
     cloudinaryPublicId: cloudIn,
+    organizationId,
+    branchId,
+    uploadedBy,
   } = jobData
   const filePath = typeof fpIn === 'string' && fpIn.trim() !== '' ? fpIn.trim() : ''
   const imageUrl = typeof imageUrlIn === 'string' ? imageUrlIn.trim() : ''
@@ -161,6 +164,9 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         aiParseFailed: false,
         needsReview,
         reviewHint,
+        organizationId,
+        branchId,
+        uploadedBy,
       }
       if (fromCloudinaryUrl && i === 0) {
         draftOpts.imageUrl = imageUrl
@@ -190,6 +196,9 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         slipForDb.confidence_flag === 'auto' ? 'auto' : 'review'
       const expense = await Expense.create({
         user: userId,
+        organizationId,
+        branchId,
+        uploadedBy: uploadedBy || userId,
         rawText: slipRaw,
         originalAiData: slipForDb,
         finalData: slipForDb,
