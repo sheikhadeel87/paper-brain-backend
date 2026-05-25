@@ -7,7 +7,7 @@ import { Organization } from '../models/Organization.js';
 import { User } from '../models/User.js';
 import { requireAuth } from '../middleware/requireAuth.js';
 import { signAuthToken, userJson } from '../lib/authSession.js';
-import { getFrontendUrl } from '../lib/frontendUrl.js';
+import { invitationLinkForToken } from '../lib/frontendUrl.js';
 import { sendMail } from '../utils/mailer.js';
 
 const router = express.Router();
@@ -52,8 +52,7 @@ function teamMemberJson(user) {
 }
 
 function inviteLinkForToken(token) {
-  const base = getFrontendUrl();
-  return `${base}/accept-invite?token=${encodeURIComponent(token)}`;
+  return invitationLinkForToken(token);
 }
 
 function validInvitationFilter(token) {

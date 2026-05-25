@@ -21,3 +21,11 @@ export function verificationLinkForToken(token) {
   }
   return `${base}/verify-email/${encodeURIComponent(token)}`;
 }
+
+export function invitationLinkForToken(token) {
+  const base = getFrontendUrl();
+  if (!base) {
+    throw new Error('FRONTEND_URL is not configured.');
+  }
+  return `${base}/accept-invite?token=${encodeURIComponent(token)}`;
+}
