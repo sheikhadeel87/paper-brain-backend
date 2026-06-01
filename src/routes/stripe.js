@@ -195,9 +195,15 @@ router.post('/checkout', requireAuth, requireEmailVerified, async (req, res, nex
   try {
     if (!requireStripeConfig(res, { needsPrice: true })) return;
 
-    const user = await User.findById(req.auth.userId).select('isVerified email name stripeCustomerId');
+    const user = await User.findById(req.auth.userId).select('isVerified email name role stripeCustomerId');
     if (!user) {
       return res.status(404).json({ success: false, error: 'User not found.' });
+    }
+    if (user.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Only the Admin account can manage the subscription for this organization.',
+      });
     }
     if (user.isVerified === false) {
       return res.status(403).json({
@@ -240,7 +246,13 @@ router.post('/portal', requireAuth, async (req, res, next) => {
   try {
     if (!requireStripeConfig(res)) return;
 
-    const user = await User.findById(req.auth.userId).select('stripeCustomerId');
+    const user = await User.findById(req.auth.userId).select('role stripeCustomerId');
+    if (user && user.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Only the Admin account can manage billing for this organization.',
+      });
+    }
     if (!user?.stripeCustomerId) {
       return res.status(404).json({
         success: false,

@@ -123,14 +123,22 @@ const uploadMemory = multer({
 
 const MULTI_UPLOAD_MAX_FILES = 10;
 
-async function userPlanForUploadLimit(userId) {
-  const user = await User.findById(userId).select('plan').lean();
-  return user?.plan || 'free';
+async function billingScopeForUploadLimit(userId) {
+  const user = await User.findById(userId).select('plan role organizationId').lean();
+  if (!user) return { plan: 'free', billingUserId: userId };
+  if (user.role !== 'MANAGER' || !user.organizationId) {
+    return { plan: user.plan || 'free', billingUserId: userId };
+  }
+
+  const organization = await Organization.findById(user.organizationId).select('ownerId').lean();
+  const ownerId = organization?.ownerId || userId;
+  const owner = await User.findById(ownerId).select('plan').lean();
+  return { plan: owner?.plan || 'free', billingUserId: ownerId };
 }
 
 /** Returns false when the response was already sent (Free tier daily cap). */
-async function enforceReceiptUploadLimit(res, userId, plan, slots) {
-  const reservation = await reserveReceiptUploadSlots(userId, plan, slots);
+async function enforceReceiptUploadLimit(res, billingUserId, plan, slots) {
+  const reservation = await reserveReceiptUploadSlots(billingUserId, plan, slots);
   if (!reservation.ok) {
     res.status(403).json(freeTierLimitJson(reservation));
     return false;
@@ -281,8 +289,8 @@ router.get('/upload-quota', async (req, res) => {
     if (!userId) {
       return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
-    const plan = await userPlanForUploadLimit(userId);
-    const usage = await getReceiptUploadUsage(userId, plan);
+    const { plan, billingUserId } = await billingScopeForUploadLimit(userId);
+    const usage = await getReceiptUploadUsage(billingUserId, plan);
     return res.json({ success: true, ...usage });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Could not load upload quota.';
@@ -305,8 +313,8 @@ router.post('/upload-multiple', upload.array('receipts', MULTI_UPLOAD_MAX_FILES)
       return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
 
-    const plan = await userPlanForUploadLimit(userId);
-    const allowed = await enforceReceiptUploadLimit(res, userId, plan, files.length);
+    const { plan, billingUserId } = await billingScopeForUploadLimit(userId);
+    const allowed = await enforceReceiptUploadLimit(res, billingUserId, plan, files.length);
     if (!allowed) {
       for (const file of files) {
         if (file?.path) await fsp.unlink(file.path).catch(() => {});
@@ -1808,8 +1816,8 @@ router.post(
 
     try {
       const userId = req.auth?.userId;
-      const plan = await userPlanForUploadLimit(userId);
-      const allowed = await enforceReceiptUploadLimit(res, userId, plan, 1);
+      const { plan, billingUserId } = await billingScopeForUploadLimit(userId);
+      const allowed = await enforceReceiptUploadLimit(res, billingUserId, plan, 1);
       if (!allowed) {
         if (filePath) await fsp.unlink(filePath).catch(() => {});
         return;
