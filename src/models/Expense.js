@@ -26,6 +26,8 @@ const expenseSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    imageUrl: { type: String, default: '' },
+    cloudinaryPublicId: { type: String, default: '' },
     rawText: { type: String, default: '' },
     /** Full Gemini JSON as returned (or `{ aiParseFailed: true }` when user saved after AI failure). */
     originalAiData: { type: mongoose.Schema.Types.Mixed, required: true },

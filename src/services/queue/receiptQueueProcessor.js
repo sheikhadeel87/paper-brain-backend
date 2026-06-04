@@ -21,6 +21,10 @@ import {
   normalizeReceiptCategory,
 } from '../../lib/receiptCategories.js'
 import { categorizeReceipt } from '../receiptCategorization.js'
+import {
+  isCloudinaryConfigured,
+  uploadReceiptImageBuffer,
+} from '../cloudinaryUpload.js'
 
 export { receiptQueueMinSlotMs } from '../../lib/receiptQueueSlotMs.js'
 
@@ -47,6 +51,8 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
   const imageUrl = typeof imageUrlIn === 'string' ? imageUrlIn.trim() : ''
   const cloudinaryPublicId = typeof cloudIn === 'string' ? cloudIn.trim() : ''
   const fromCloudinaryUrl = Boolean(imageUrl) && !filePath
+  let persistedImageUrl = imageUrl
+  let persistedCloudinaryPublicId = cloudinaryPublicId
   let tempFile = null
 
   console.log('[receiptQueueProcessor] job processing started', {
@@ -73,6 +79,20 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
     } else {
       if (!filePath) {
         throw new Error('Queue job missing filePath and imageUrl')
+      }
+      if (isCloudinaryConfigured()) {
+        try {
+          const buf = await fsp.readFile(filePath)
+          const uploaded = await uploadReceiptImageBuffer(buf, {
+            userId,
+            originalFilename: fileName,
+          })
+          persistedImageUrl = uploaded.url
+          persistedCloudinaryPublicId = uploaded.publicId
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          console.warn('[receiptQueueProcessor] original image upload skipped:', msg)
+        }
       }
       if (receiptTesseractEnabled()) {
         console.log('[receiptQueueProcessor] Tesseract OCR started', { filePath })
@@ -167,10 +187,8 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         organizationId,
         branchId,
         uploadedBy,
-      }
-      if (fromCloudinaryUrl && i === 0) {
-        draftOpts.imageUrl = imageUrl
-        draftOpts.cloudinaryPublicId = cloudinaryPublicId
+        imageUrl: persistedImageUrl,
+        cloudinaryPublicId: persistedCloudinaryPublicId,
       }
       const receiptId = await createReceiptDraft(userId, draftOpts)
       receiptIds.push(String(receiptId))
@@ -199,6 +217,8 @@ export async function processReceiptQueueJobData(jobData, options = {}) {
         organizationId,
         branchId,
         uploadedBy: uploadedBy || userId,
+        imageUrl: persistedImageUrl,
+        cloudinaryPublicId: persistedCloudinaryPublicId,
         rawText: slipRaw,
         originalAiData: slipForDb,
         finalData: slipForDb,

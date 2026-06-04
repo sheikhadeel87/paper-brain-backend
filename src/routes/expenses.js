@@ -90,11 +90,15 @@ function uploaderJson(user) {
   };
 }
 
-function enrichExpenseRow(row) {
+function enrichExpenseRow(row, receiptByExpenseId = new Map()) {
+  const linkedReceipt = receiptByExpenseId.get(String(row?._id || '')) || null;
+  const imageUrl = row?.imageUrl || linkedReceipt?.imageUrl || '';
   return {
     ...row,
     branch: branchJson(row.branchId),
     uploadedByUser: uploaderJson(row.uploadedBy),
+    receiptId: linkedReceipt?._id?.toString?.() || '',
+    receiptImageUrl: imageUrl,
   };
 }
 
@@ -136,6 +140,8 @@ async function repairMissingExpensesFromParsedReceipts(scope) {
       organizationId: receipt.organizationId,
       branchId: receipt.branchId,
       uploadedBy: receipt.uploadedBy || receipt.user,
+      imageUrl: receipt.imageUrl || '',
+      cloudinaryPublicId: receipt.cloudinaryPublicId || '',
       rawText: typeof receipt.rawText === 'string' ? receipt.rawText : '',
       originalAiData: finalData,
       finalData,
@@ -159,31 +165,38 @@ async function backfillExpenseScopesFromReceipts(scope) {
     ...dataAccessFilter(scope),
     expense: { $ne: null },
   })
-    .select('expense organizationId branchId uploadedBy user')
+    .select('expense organizationId branchId uploadedBy user imageUrl cloudinaryPublicId')
     .lean();
 
   const writes = [];
   for (const receipt of receipts) {
     if (!receipt.expense || !receipt.organizationId || !receipt.branchId) continue;
+    const needsScopeBackfill = [
+      { organizationId: { $exists: false } },
+      { organizationId: null },
+      { branchId: { $exists: false } },
+      { branchId: null },
+      { uploadedBy: { $exists: false } },
+      { uploadedBy: null },
+    ];
+    const setFields = {
+      organizationId: receipt.organizationId,
+      branchId: receipt.branchId,
+      uploadedBy: receipt.uploadedBy || receipt.user,
+    };
+    if (receipt.imageUrl) {
+      needsScopeBackfill.push({ imageUrl: { $exists: false } }, { imageUrl: '' });
+      setFields.imageUrl = receipt.imageUrl;
+      setFields.cloudinaryPublicId = receipt.cloudinaryPublicId || '';
+    }
     writes.push({
       updateOne: {
         filter: {
           _id: receipt.expense,
-          $or: [
-            { organizationId: { $exists: false } },
-            { organizationId: null },
-            { branchId: { $exists: false } },
-            { branchId: null },
-            { uploadedBy: { $exists: false } },
-            { uploadedBy: null },
-          ],
+          $or: needsScopeBackfill,
         },
         update: {
-          $set: {
-            organizationId: receipt.organizationId,
-            branchId: receipt.branchId,
-            uploadedBy: receipt.uploadedBy || receipt.user,
-          },
+          $set: setFields,
         },
       },
     });
@@ -383,9 +396,21 @@ router.get('/', async (req, res) => {
       Expense.countDocuments(filter),
       spendingSummary(filter),
     ]);
+    const expenseIds = expenses.map((expense) => expense._id).filter(Boolean);
+    const linkedReceipts =
+      expenseIds.length > 0
+        ? await Receipt.find({ expense: { $in: expenseIds } })
+            .select('_id expense imageUrl')
+            .lean()
+        : [];
+    const receiptByExpenseId = new Map(
+      linkedReceipts.map((receipt) => [String(receipt.expense || ''), receipt]),
+    );
     return res.json({
       success: true,
-      expenses: expenses.map(enrichExpenseRow),
+      expenses: expenses.map((expense) =>
+        enrichExpenseRow(expense, receiptByExpenseId),
+      ),
       totalCount,
       summary,
       limit,
@@ -566,7 +591,9 @@ router.post('/', async (req, res) => {
         expense: null,
         ...dataAccessFilter(scope),
       })
-        .select('_id category categorySource organizationId branchId uploadedBy')
+        .select(
+          '_id category categorySource organizationId branchId uploadedBy imageUrl cloudinaryPublicId',
+        )
         .lean();
       if (!pendingReceipt) {
         return res.status(400).json({
@@ -584,12 +611,19 @@ router.post('/', async (req, res) => {
         uploadedBy: pendingReceipt.uploadedBy || scope.userId,
       };
     }
+    const imageFields = pendingReceipt
+      ? {
+          imageUrl: pendingReceipt.imageUrl || '',
+          cloudinaryPublicId: pendingReceipt.cloudinaryPublicId || '',
+        }
+      : {};
 
     const expense = await Expense.create({
       user: req.auth.userId,
       organizationId: expenseScope.organizationId,
       branchId: expenseScope.branchId,
       uploadedBy: expenseScope.uploadedBy,
+      ...imageFields,
       rawText: v.rawText,
       originalAiData: v.original,
       finalData: v.normalized,

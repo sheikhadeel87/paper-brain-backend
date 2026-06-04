@@ -865,6 +865,8 @@ export async function createReceiptDraft(
     needsReview,
     reviewHint = '',
     processingStatus,
+    imageUrl,
+    cloudinaryPublicId,
     organizationId,
     branchId,
     uploadedBy,
@@ -888,6 +890,9 @@ export async function createReceiptDraft(
     needsReview: Boolean(needsReview),
     reviewHint: hint,
     expense: null,
+    imageUrl: typeof imageUrl === 'string' ? imageUrl : '',
+    cloudinaryPublicId:
+      typeof cloudinaryPublicId === 'string' ? cloudinaryPublicId : '',
   };
   let fields =
     aiData && typeof aiData === 'object' && !aiParseFailed
@@ -1355,6 +1360,8 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
             reviewHint: hint,
             processingStatus: 'completed',
             processingError: '',
+            imageUrl: img,
+            cloudinaryPublicId: cid,
             linkedReceiptIds: [],
           },
         },
@@ -1368,6 +1375,8 @@ export async function finalizePendingReceiptsFromGemini(pendingReceiptId, userId
         needsReview,
         reviewHint: hint,
         processingStatus: 'completed',
+        imageUrl: img,
+        cloudinaryPublicId: cid,
         ...receiptScope,
       });
       createdIds.push(String(newId));
@@ -1959,6 +1968,23 @@ router.post(
         );
       }
 
+      let uploadedImageUrl = '';
+      let uploadedCloudinaryPublicId = '';
+      if (isCloudinaryConfigured()) {
+        try {
+          const buf = await fsp.readFile(filePath);
+          const uploaded = await uploadReceiptImageBuffer(buf, {
+            userId,
+            originalFilename: req.file.originalname,
+          });
+          uploadedImageUrl = uploaded.url;
+          uploadedCloudinaryPublicId = uploaded.publicId;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn('[receipt] original image upload skipped:', msg);
+        }
+      }
+
       let rawText = '';
       let ocrFailed = true;
 
@@ -2002,6 +2028,8 @@ router.post(
           organizationId: receiptScope.organizationId,
           branchId: receiptScope.branchId,
           uploadedBy: receiptScope.uploadedBy,
+          imageUrl: uploadedImageUrl,
+          cloudinaryPublicId: uploadedCloudinaryPublicId,
         });
         return res.status(200).json(
           receiptJson({
@@ -2043,6 +2071,8 @@ router.post(
           organizationId: receiptScope.organizationId,
           branchId: receiptScope.branchId,
           uploadedBy: receiptScope.uploadedBy,
+          imageUrl: uploadedImageUrl,
+          cloudinaryPublicId: uploadedCloudinaryPublicId,
         });
         created.push({
           receiptId,
