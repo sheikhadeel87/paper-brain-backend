@@ -24,10 +24,10 @@ router.post('/register', async (req, res) => {
       error: 'Name, email, and password are required.',
     });
   }
-  if (!/^[A-Za-z]+ [A-Za-z]+$/.test(name)) {
+  if (!/^[A-Za-z]+( [A-Za-z]+)*$/.test(name)) {
     return res.status(400).json({
       success: false,
-      error: 'Enter first and last name using alphabets only, e.g. Muhammad Adeel.',
+      error: 'Use alphabets and spaces only, e.g. Ahmed or Muhammad Adeel.',
     });
   }
   if (password.length < 6) {

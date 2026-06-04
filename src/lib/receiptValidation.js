@@ -210,6 +210,9 @@ export function applyReceiptValidation(aiData) {
   aiData.items = cleanItems(aiData.items);
   aiData.items = sanitizeItemPrices(aiData.items);
   aiData.currency = normalizeCurrency(aiData.currency);
+  if (aiData.date === '1970-01-01') {
+    aiData.date = '';
+  }
 
   const validation = validateTotals(aiData.items, aiData.total, aiData.tax);
   const noItems = !aiData.items || aiData.items.length === 0;
